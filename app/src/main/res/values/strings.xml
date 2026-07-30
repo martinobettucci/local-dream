@@ -6,6 +6,7 @@
     <string name="anythingv5_description">Anime Image Generation</string>
     <string name="cyberrealistic_description">Realistic Image Generation</string>
     <string name="illustriousv16_description">WAI Illustrious SDXL v16</string>
+    <string name="zimage_turbo_description">6B DiT, 8 steps, natural-language prompts</string>
     <string name="dmd2_description">Merged with DMD2 LoRA</string>
     <string name="capture_logs">Capture logs</string>
     <string name="capture_logs_hint">Collect app logs while a model is running, then show them after you exit</string>

@@ -1,6 +1,7 @@
 package io.github.xororz.localdream.data
 
 import android.annotation.SuppressLint
+import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
 import android.os.Build
@@ -541,6 +542,9 @@ class ModelRepository private constructor(private val context: Context) {
         val customModels = scanCustomModels()
 
         val predefinedModels = mutableListOf<Model>().apply {
+            if (isZImageCapableDevice()) {
+                add(createZImageTurboModel())
+            }
             if (isSdxlCapableSoc(getDeviceSoc())) {
                 add(createIllustriousV16Model())
                 add(createIllustriousV16Dmd2Model())
@@ -571,6 +575,60 @@ class ModelRepository private constructor(private val context: Context) {
     }
 
     private fun isSdxlCapableSoc(soc: String): Boolean = soc in setOf("SM8750", "SM8750P", "SM8850", "SM8850P", "SM8845", "SM8650")
+
+    // Z-Image asks for more than any other format here: a 6B DiT plus a 4B text
+    // encoder, ~5.8GB of w4a16 weights streamed through the HTP a stage at a
+    // time. The SoC gate is SDXL's (8 Gen 3 and newer), but SoC alone says
+    // nothing about RAM, and below ~12GB the model cannot be run even with
+    // sequential DiT loading — so a device that would only ever fail is not
+    // shown a 5.8GB download.
+    private fun isZImageCapableDevice(): Boolean = isSdxlCapableSoc(getDeviceSoc()) && deviceTotalRamGb() >= 11
+
+    // Rounded down; a nominally 12GB device reports slightly less than 12.
+    private fun deviceTotalRamGb(): Long {
+        val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager ?: return 0
+        val info = ActivityManager.MemoryInfo()
+        am.getMemoryInfo(info)
+        return info.totalMem / (1024L * 1024L * 1024L)
+    }
+
+    // Z-Image-Turbo, w4a16, split across several HTP contexts.
+    //
+    // NOTE: the weights this points at are not published yet — see
+    // docs/zimage.md. Until the P2Enjoy repo below actually holds the zip, the
+    // download will fail; the entry exists so that publishing the artifact is
+    // the only remaining step.
+    private fun createZImageTurboModel(): Model {
+        val id = "zimage_turbo"
+        val fileUri = "P2Enjoy/z-image-turbo-qnn/resolve/main/z_image_turbo_w4a16_qnn2.39_8gen3.zip"
+
+        val isDownloaded = Model.isModelDownloaded(context, id, false)
+
+        return Model(
+            id = id,
+            name = "Z-Image Turbo",
+            description = context.getString(R.string.zimage_turbo_description),
+            baseUrl = baseUrl,
+            fileUri = fileUri,
+            generationSize = 1024,
+            approximateSize = "5.8GB",
+            isDownloaded = isDownloaded,
+            // Unlike the other distilled models here, these are set in code
+            // rather than left to a bundled config.json. Turbo is guidance-free:
+            // at the global default of cfg 7 / 20 steps it produces garbage AND
+            // takes four times as long, so the correct values must not depend on
+            // a file that might be missing from the archive.
+            codeDefaults = ModelConfig(
+                prompt = "A cat sitting on a woven mat by a sunlit window, photorealistic.",
+                negativePrompt = "",
+                steps = 8f,
+                cfg = 1f,
+                scheduler = "euler",
+            ),
+            runOnCpu = false,
+            isZImage = true,
+        )
+    }
 
     private fun createCyberRealisticV10Model(): Model {
         val id = "cyber_realistic_v10"
@@ -941,6 +999,8 @@ class ModelRepository private constructor(private val context: Context) {
         // entry on disk and in the UI list, so they are skipped during scan.
         // Keep in sync with the create*Model() functions and UpscalerRepository.
         private val RESERVED_MODEL_IDS = setOf(
+            // Z-Image (NPU)
+            "zimage_turbo",
             // SDXL (NPU)
             "illustrious_v16", "illustrious_v16_dmd2",
             "cyber_realistic_v10", "cyber_realistic_v10_dmd2",

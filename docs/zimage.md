@@ -254,3 +254,74 @@ to dominate the wall clock.
 If context creation fails with a message about the required spill-fill size,
 set `LOCALDREAM_ZIMAGE_SPILL_FILL_BYTES` to the largest value the log reports
 across the parts. Setting it to `0` disables buffer sharing entirely.
+
+---
+
+## 7. Publishing the weights
+
+The app ships a built-in entry for Z-Image Turbo (`ModelRepository.createZImageTurboModel`)
+that points at a Hugging Face repo which **does not exist yet**. Until the
+archive below is published, tapping Download fails; everything else about the
+entry is wired.
+
+What the entry expects:
+
+| | |
+|---|---|
+| Model id | `zimage_turbo` (reserved, so a side-loaded model cannot shadow it) |
+| URL | `<baseUrl>/P2Enjoy/z-image-turbo-qnn/resolve/main/z_image_turbo_w4a16_qnn2.39_8gen3.zip` |
+| `baseUrl` | user-selected: `https://huggingface.co/`, an hf-mirror, or a custom host |
+| Shown on | 8 Gen 3 / 8 Elite class SoC **and** ≥ 11 GB reported RAM |
+| Listed size | `5.8GB` — update `approximateSize` if the real archive differs |
+
+The zip's contents are extracted directly into the model directory, so it must
+unpack to exactly the layout in section 3 — the files at the archive root, not
+nested inside a folder. `ZIMAGE` and `config.json` are not needed for the
+built-in entry (the marker only matters for side-loaded models, and steps / cfg
+/ scheduler are set in code because `codeDefaults` outrank a bundled
+`config.json`). They are harmless to include, and worth including if you also
+want the same archive to work as a manual import.
+
+To point the app somewhere else, change `fileUri` in
+`createZImageTurboModel()`; to widen or narrow which devices see it, change
+`isZImageCapableDevice()`.
+
+---
+
+## 8. Building the APK
+
+**Gradle does not build the native code.** There is no `externalNativeBuild`
+block in `app/build.gradle.kts` — `libstable_diffusion_core.so` and the QNN
+runtime libraries are produced by a separate CMake build and are *gitignored*
+(`app/src/main/jniLibs`, `app/src/main/assets/qnnlibs`). Running `./gradlew`
+on a fresh clone therefore succeeds but yields an APK **with no native library
+in it**, which cannot run any model. The native build has to happen first.
+
+Prerequisites:
+
+- Android SDK (`compileSdk 37`), JDK 21, Gradle 9.3.1 (via the wrapper)
+- Android NDK **r28** at `/data/android-ndk-r28`, or `ANDROID_NDK_ROOT` set
+  (see `app/src/main/cpp/CMakePresets.json`)
+- Qualcomm AI Engine Direct SDK **2.39.0.250926** at `/data/qairt/2.39.0.250926`
+  (path hardcoded as `QNN_SDK_ROOT` in `app/src/main/cpp/CMakeLists.txt`).
+  This one is not optional and not publicly downloadable — it requires a
+  Qualcomm Developer account. Without it the CMake configure step fails
+  immediately at the `file(COPY ${QNN_SDK_ROOT}/...)` calls.
+- `ninja`, `ccache`
+- A Rust toolchain (for the `tokenizers-cpp` submodule)
+
+Steps:
+
+```bash
+git submodule update --init --recursive     # MNN, tokenizers-cpp, zstd, xtensor, ...
+cd app/src/main/cpp && ./build.sh            # -> jniLibs/arm64-v8a/ + assets/qnnlibs/
+cd ../../../.. && ./gradlew assembleBasicRelease
+```
+
+Flavors are `basic` and `filter` (the latter bundles the NSFW checker), so the
+tasks are `assembleBasicRelease` / `assembleFilterRelease`. Release signing
+reads `RELEASE_STORE_FILE`, `RELEASE_STORE_PASSWORD`, `RELEASE_KEY_ALIAS` and
+`RELEASE_KEY_PASSWORD` from Gradle properties; use `assembleBasicDebug` if you
+just want something installable.
+
+Only `arm64-v8a` is built — the QNN backend has no other target.

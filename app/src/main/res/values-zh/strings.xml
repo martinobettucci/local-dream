@@ -6,6 +6,7 @@
     <string name="anythingv5_description">动漫图像生成模型</string>
     <string name="cyberrealistic_description">现实场景生成模型</string>
     <string name="illustriousv16_description">WAI Illustrious SDXL v16</string>
+    <string name="zimage_turbo_description">6B DiT，8 步，自然语言提示词</string>
     <string name="dmd2_description">融合了 DMD2 LoRA</string>
     <string name="capture_logs">收集日志</string>
     <string name="capture_logs_hint">运行模型时收集应用日志，退出后展示</string>

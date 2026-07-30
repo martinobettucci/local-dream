@@ -6,6 +6,7 @@
     <string name="anythingv5_description">애니풍 이미지 생성</string>
     <string name="cyberrealistic_description">사실적인 이미지 생성</string>
     <string name="illustriousv16_description">WAI Illustrious SDXL v16</string>
+    <string name="zimage_turbo_description">6B DiT, 8스텝, 자연어 프롬프트</string>
     <string name="dmd2_description">DMD2 LoRA 병합</string>
     <string name="capture_logs">로그 수집</string>
     <string name="capture_logs_hint">모델 실행 중 앱 로그를 수집하고 종료 후 표시합니다</string>
