@@ -20,8 +20,12 @@
 // base64 image/mask decoding, the SDXL aspect-ratio padding setup
 // (synthetic canvas, paint-rectangle mask synthesis / intersection), and the
 // ultrafix (tiled img2img) validation.
+//
+// `dit` covers the fixed-1024, 16-channel rectified-flow DiT formats (Anima,
+// Z-Image): they share SDXL's fixed canvas and aspect-pad inpaint behaviour but
+// carry 16 latent channels instead of 4.
 inline GenerationRequest parseGenerationRequest(const nlohmann::json &json,
-                                                bool sdxl, bool anima,
+                                                bool sdxl, bool dit,
                                                 bool img2img_available,
                                                 bool ultrafix_supported) {
   GenerationRequest req;
@@ -75,10 +79,11 @@ inline GenerationRequest parseGenerationRequest(const nlohmann::json &json,
     req.show_diffusion_process = false;
   }
 
-  // SDXL and Anima both run fixed-1024 graphs; force the canvas regardless of
-  // what the client sent so a stale/wrong size can't reach the QNN graphs.
-  // (Anima has no ultrafix path, so the !ultrafix guard is moot there.)
-  if ((sdxl || anima) && !req.ultrafix) {
+  // SDXL and the DiT formats all run fixed-1024 graphs; force the canvas
+  // regardless of what the client sent so a stale/wrong size can't reach the
+  // QNN graphs. (Neither DiT format has an ultrafix path, so the !ultrafix
+  // guard is moot there.)
+  if ((sdxl || dit) && !req.ultrafix) {
     req.width = 1024;
     req.height = 1024;
   }
@@ -92,20 +97,20 @@ inline GenerationRequest parseGenerationRequest(const nlohmann::json &json,
 
   const int sample_w = req.width / 8;
   const int sample_h = req.height / 8;
-  // Latent channel count of the target format: SD/SDXL = 4, Anima = 16. The
-  // latent-space inpaint mask is replicated across every channel, so it must be
-  // sized to match (Pipeline reads it as {1, latent_ch, h, w}).
-  const int latent_ch = anima ? anima_latent_channels : 4;
+  // Latent channel count of the target format: SD/SDXL = 4, Anima and Z-Image
+  // = 16. The latent-space inpaint mask is replicated across every channel, so
+  // it must be sized to match (Pipeline reads it as {1, latent_ch, h, w}).
+  const int latent_ch = dit ? anima_latent_channels : 4;
 
   // --- Fixed-1024 aspect ratio: parse target dims first ------------------
-  // SDXL and Anima both render on a fixed 1024 canvas and reach non-1:1
-  // outputs by inpainting a centered crop. Resolve target_crop_w/h from
+  // SDXL and the DiT formats all render on a fixed 1024 canvas and reach
+  // non-1:1 outputs by inpainting a centered crop. Resolve target_crop_w/h from
   // aspect_ratio independently of img/mask presence so all three modes
   // (txt2img / img2img / inpaint) share the same downstream crop-after-decode
   // behavior. Requires a VAE encoder so the synthetic black canvas can be
   // encoded as the inpaint base latent; if the build was started without one,
   // fall through to plain 1024x1024 generation.
-  if ((sdxl || anima) && json.contains("aspect_ratio") && img2img_available &&
+  if ((sdxl || dit) && json.contains("aspect_ratio") && img2img_available &&
       !req.ultrafix) {
     std::string ar = json["aspect_ratio"].get<std::string>();
     auto colon = ar.find(':');

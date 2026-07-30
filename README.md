@@ -25,6 +25,13 @@ If you like it, please consider [sponsor](#-support-this-project) this project.
 >
 > If your chip is outside the above scope, you can only run SD1.5 on CPU/GPU.
 >
+> **Z-Image:** a runner for [Z-Image](https://github.com/Tongyi-MAI/Z-Image) /
+> Z-Image-Turbo (`--type zimage`) is included — the 6B S3-DiT with its Qwen3-4B
+> text encoder and Flux VAE, split across several NPU contexts. No converted
+> weights ship with the app; see [docs/zimage.md](./docs/zimage.md) for the file
+> layout, the graph IO contract a conversion has to satisfy, and why the
+> practical quantization target is 4-bit weights rather than lower.
+>
 > You can join our [telegram group](https://t.me/local_dream) for discussion or help with testing.
 
 ## User Guide

@@ -172,6 +172,10 @@ class Pipeline {
   // Anima runs the same fixed-1024 graphs as SDXL but isn't an SDXL pipeline;
   // the request parser uses this to force the 1024 canvas.
   virtual bool isAnima() const { return false; }
+  // Z-Image likewise renders on the fixed 1024 canvas its graphs were exported
+  // for, and like Anima is a 16-channel rectified-flow DiT rather than an SDXL
+  // pipeline.
+  virtual bool isZImage() const { return false; }
   // Ultrafix needs the VAE encoder (img2img) plus fixed-size graphs that can
   // be run as tiles; the MNN (CPU) format has neither constraint nor need.
   virtual bool supportsUltrafix() const {
@@ -353,8 +357,13 @@ inline Conditioning Pipeline::encodePrompts(const GenerationRequest &req) {
   cond.pooled_dim = textPooledDim();
   cond.seq_len = textSeqLen();
   cond.hidden.assign((size_t)batch_size * cond.seq_len * cond.hidden_dim, 0.0f);
-  if (sdxl_) {
+  // Any format declaring a non-zero pooled dim gets the buffer; SDXL is the
+  // only one that also needs the micro-conditioning time_ids (Z-Image parks
+  // its caption attention mask in the same slot).
+  if (cond.pooled_dim > 0) {
     cond.pooled.assign((size_t)batch_size * cond.pooled_dim, 0.0f);
+  }
+  if (sdxl_) {
     cond.time_ids.assign((size_t)batch_size * 6, 0.0f);
     for (int b = 0; b < batch_size; b++) {
       cond.time_ids[b * 6 + 0] = (float)req.height;  // original_size h
@@ -380,8 +389,11 @@ inline Conditioning Pipeline::encodePrompts(const GenerationRequest &req) {
       !cache_dir.empty() && !text_encoder_.promptHasEmbedding(req.prompt);
 
   const uint32_t cache_mode =
-      isAnima() ? prompt_cache::kModeAnima
-                : (sdxl_ ? prompt_cache::kModeSdxl : prompt_cache::kModeSd15);
+      isZImage()
+          ? prompt_cache::kModeZImage
+          : (isAnima() ? prompt_cache::kModeAnima
+                       : (sdxl_ ? prompt_cache::kModeSdxl
+                                : prompt_cache::kModeSd15));
 
   bool neg_hit =
       neg_cache_eligible &&

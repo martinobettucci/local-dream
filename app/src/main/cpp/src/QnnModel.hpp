@@ -25,7 +25,7 @@ class QnnModel : public QnnSampleApp {
   Qnn_Tensor_t *inputs = nullptr;
   Qnn_Tensor_t *outputs = nullptr;
   void *m_modelHandle = nullptr;
-  bool anima_io_logged_ = false;
+  bool io_logged_ = false;
   QnnModel(QnnFunctionPointers qnnFunctionPointers, std::string inputListPaths,
            std::string opPackagePaths, void *backendHandle,
            std::string outputPath = s_defaultOutputPath, bool debug = false,
@@ -692,7 +692,17 @@ class QnnModel : public QnnSampleApp {
                        const char *name, const float *src, size_t elems) {
     Qnn_Tensor_t *t = findTensor(inputs, graphInfo.numInputTensors, name);
     if (!t) {
-      QNN_ERROR("anima: missing input tensor '%s'", name);
+      QNN_ERROR("missing input tensor '%s'", name);
+      return false;
+    }
+    // A shape the caller and the graph disagree on would otherwise be a silent
+    // heap overrun. It is a real risk for the split-DiT paths, where the
+    // handoff sizes come from whatever the conversion produced rather than from
+    // constants in this file.
+    const size_t capacity = tensorElems(*t);
+    if (elems != capacity) {
+      QNN_ERROR("input tensor '%s' expects %zu elements, got %zu", name,
+                capacity, elems);
       return false;
     }
     memcpy(QNN_TENSOR_GET_CLIENT_BUF(*t).data, src, elems * sizeof(float));
@@ -719,16 +729,21 @@ class QnnModel : public QnnSampleApp {
 
   // One-time dump of a graph's IO names+sizes, so the on-device tensor naming
   // can be verified against export_onnx_anima.py's input/output_names.
-  void logAnimaIoOnce(const char *tag,
+  void logGraphIoOnce(const char *format, const char *tag,
                       const qnn_wrapper_api::GraphInfo_t &graphInfo) {
-    if (anima_io_logged_) return;
-    anima_io_logged_ = true;
+    if (io_logged_) return;
+    io_logged_ = true;
     for (uint32_t i = 0; i < graphInfo.numInputTensors; ++i)
-      QNN_INFO("[anima %s] in[%u] name=%s elems=%zu", tag, i,
+      QNN_INFO("[%s %s] in[%u] name=%s elems=%zu", format, tag, i,
                QNN_TENSOR_GET_NAME(inputs[i]), tensorElems(inputs[i]));
     for (uint32_t i = 0; i < graphInfo.numOutputTensors; ++i)
-      QNN_INFO("[anima %s] out[%u] name=%s elems=%zu", tag, i,
+      QNN_INFO("[%s %s] out[%u] name=%s elems=%zu", format, tag, i,
                QNN_TENSOR_GET_NAME(outputs[i]), tensorElems(outputs[i]));
+  }
+
+  void logAnimaIoOnce(const char *tag,
+                      const qnn_wrapper_api::GraphInfo_t &graphInfo) {
+    logGraphIoOnce("anima", tag, graphInfo);
   }
 
   // ---- Anima (split DiT + 16-ch Wan VAE) -----------------------------------
@@ -891,6 +906,213 @@ class QnnModel : public QnnSampleApp {
     }
     memcpy(out_context, QNN_TENSOR_GET_CLIENT_BUF(*to).data,
            (size_t)TS * D * sizeof(float));
+    return StatusCode::SUCCESS;
+  }
+
+  // ---- Z-Image (S3-DiT, N-way split + Flux 16-ch VAE) ----------------------
+  // The S3-DiT is single-stream: text and image tokens live in ONE residual
+  // sequence, so unlike Anima's split there is no separate `context` to
+  // re-supply past the first part — the caption tokens are already inside
+  // `hidden`. What every part does need is the timestep (each recomputes its
+  // own adaLN modulation, avoiding the slow flat-tensor layout Anima hit) and
+  // the caption mask (padded caption rows must not be attended to, and the pad
+  // count is prompt-dependent, so it cannot be baked into the graph).
+  //
+  // 6B parameters do not fit a single HTP context at any supported weight
+  // width, so the DiT is exported as N pieces cut between transformer blocks.
+  // The chain is uniform and N is discovered on disk, not fixed here:
+  //   part 1    : (sample, timestep, context, text_mask) -> (hidden, emb)
+  //   part 1<k<N: (hidden, emb, timestep, text_mask)     -> (hidden)
+  //   part N    : (hidden, emb, timestep, text_mask)     -> (out_sample)
+  // A part is recognised as terminal purely by exposing an output named
+  // `out_sample`, so a single-context export (N = 1, i.e. part 1 terminal)
+  // needs no special case.
+  static constexpr const char *kZImageStateNames[2] = {"hidden", "emb"};
+  static constexpr const char *kZImageOutName = "out_sample";
+
+  // Collects whatever the part produced. A terminal part writes the velocity
+  // into out_sample; any other part refreshes `hidden` (and `emb`, if that part
+  // chose to re-emit it rather than let the host re-supply the unchanged one).
+  StatusCode readZImageDitOutputs(const qnn_wrapper_api::GraphInfo_t &graphInfo,
+                                  std::vector<std::vector<float>> &state,
+                                  float *out_sample) {
+    Qnn_Tensor_t *term =
+        findTensor(outputs, graphInfo.numOutputTensors, kZImageOutName);
+    if (term) {
+      if (!out_sample) {
+        QNN_ERROR("zimage dit: terminal part reached with no output buffer");
+        return StatusCode::FAILURE;
+      }
+      const size_t latent_elems =
+          (size_t)zimage_latent_channels * sample_width * sample_height;
+      memcpy(out_sample, QNN_TENSOR_GET_CLIENT_BUF(*term).data,
+             latent_elems * sizeof(float));
+      return StatusCode::SUCCESS;
+    }
+
+    state.resize(2);
+    bool saw_hidden = false;
+    for (int k = 0; k < 2; ++k) {
+      Qnn_Tensor_t *t = findTensor(outputs, graphInfo.numOutputTensors,
+                                   kZImageStateNames[k]);
+      // `emb` is constant for the whole chain, so only part 1 has to emit it;
+      // later parts may omit it and keep the copy the host already holds.
+      if (!t) continue;
+      size_t n = tensorElems(*t);
+      state[k].resize(n);
+      memcpy(state[k].data(), QNN_TENSOR_GET_CLIENT_BUF(*t).data,
+             n * sizeof(float));
+      if (k == 0) saw_hidden = true;
+    }
+    if (!saw_hidden) {
+      QNN_ERROR("zimage dit: part emitted neither '%s' nor '%s'",
+                kZImageOutName, kZImageStateNames[0]);
+      return StatusCode::FAILURE;
+    }
+    if (state[1].empty()) {
+      QNN_ERROR("zimage dit: '%s' never produced by any part",
+                kZImageStateNames[1]);
+      return StatusCode::FAILURE;
+    }
+    return StatusCode::SUCCESS;
+  }
+
+  // True when this graph ends the chain (emits the velocity rather than a
+  // residual-stream handoff).
+  bool zimageGraphIsTerminal() {
+    if (!ensureIoTensors()) return false;
+    auto graphInfo = (*m_graphsInfo)[0];
+    return findTensor(outputs, graphInfo.numOutputTensors, kZImageOutName) !=
+           nullptr;
+  }
+
+  // part 1: (sample, timestep, context, text_mask) -> (hidden, emb), or
+  // straight to out_sample when the whole DiT fits one context.
+  StatusCode executeZImageDitFirst(const float *sample, float timestep,
+                                   const float *context, const float *text_mask,
+                                   std::vector<std::vector<float>> &state,
+                                   float *out_sample) {
+    if (!ensureIoTensors()) return StatusCode::FAILURE;
+    auto graphInfo = (*m_graphsInfo)[0];
+    logGraphIoOnce("zimage", "dit_part1", graphInfo);
+
+    const size_t latent_elems =
+        (size_t)zimage_latent_channels * sample_width * sample_height;
+    const size_t ctx_elems =
+        (size_t)zimage_text_seq_len * zimage_text_embedding_size;
+    if (!writeNamedFloat(graphInfo, "sample", sample, latent_elems) ||
+        !writeNamedFloat(graphInfo, "timestep", &timestep, 1) ||
+        !writeNamedFloat(graphInfo, "context", context, ctx_elems) ||
+        !writeNamedFloat(graphInfo, "text_mask", text_mask,
+                         zimage_text_seq_len))
+      return StatusCode::FAILURE;
+
+    if (!runGraph(graphInfo, "zimage dit part1")) return StatusCode::FAILURE;
+    return readZImageDitOutputs(graphInfo, state, out_sample);
+  }
+
+  // Every part after the first. `state` carries {hidden, emb} in and is updated
+  // in place; a terminal part writes out_sample and leaves state untouched.
+  StatusCode executeZImageDitNext(std::vector<std::vector<float>> &state,
+                                  float timestep, const float *text_mask,
+                                  float *out_sample) {
+    if (!ensureIoTensors()) return StatusCode::FAILURE;
+    auto graphInfo = (*m_graphsInfo)[0];
+    logGraphIoOnce("zimage", "dit_partN", graphInfo);
+
+    if (state.size() < 2 || state[0].empty() || state[1].empty()) {
+      QNN_ERROR("zimage dit: residual state not populated by the prior part");
+      return StatusCode::FAILURE;
+    }
+    if (!writeNamedFloat(graphInfo, kZImageStateNames[0], state[0].data(),
+                         state[0].size()) ||
+        !writeNamedFloat(graphInfo, kZImageStateNames[1], state[1].data(),
+                         state[1].size()) ||
+        !writeNamedFloat(graphInfo, "timestep", &timestep, 1) ||
+        !writeNamedFloat(graphInfo, "text_mask", text_mask,
+                         zimage_text_seq_len))
+      return StatusCode::FAILURE;
+
+    if (!runGraph(graphInfo, "zimage dit part")) return StatusCode::FAILURE;
+    return readZImageDitOutputs(graphInfo, state, out_sample);
+  }
+
+  // Z-Image VAE decoder: 16-ch latent -> 3-ch pixels. Identical contract to
+  // Anima's (both are 16-channel), kept as its own entry point so the two
+  // formats' constants never cross.
+  StatusCode executeZImageVaeDecoder(const float *latents,
+                                     float *pixel_values) {
+    if (!ensureIoTensors()) return StatusCode::FAILURE;
+    auto graphInfo = (*m_graphsInfo)[0];
+    logGraphIoOnce("zimage", "vae_decoder", graphInfo);
+
+    const size_t latent_elems =
+        (size_t)zimage_latent_channels * sample_width * sample_height;
+    memcpy(static_cast<float *>(QNN_TENSOR_GET_CLIENT_BUF(inputs[0]).data),
+           latents, latent_elems * sizeof(float));
+
+    if (!runGraph(graphInfo, "zimage vae decoder")) return StatusCode::FAILURE;
+
+    const size_t pixel_elems = (size_t)3 * output_width * output_height;
+    memcpy(pixel_values,
+           static_cast<float *>(QNN_TENSOR_GET_CLIENT_BUF(outputs[0]).data),
+           pixel_elems * sizeof(float));
+    return StatusCode::SUCCESS;
+  }
+
+  // 3-ch pixels (-1..1) -> 16-ch latent distribution (mean, std).
+  StatusCode executeZImageVaeEncoder(const float *pixel_values, float *mean,
+                                     float *std_dev) {
+    if (!ensureIoTensors()) return StatusCode::FAILURE;
+    auto graphInfo = (*m_graphsInfo)[0];
+    logGraphIoOnce("zimage", "vae_encoder", graphInfo);
+
+    const size_t pixel_elems = (size_t)3 * output_width * output_height;
+    memcpy(static_cast<float *>(QNN_TENSOR_GET_CLIENT_BUF(inputs[0]).data),
+           pixel_values, pixel_elems * sizeof(float));
+
+    if (!runGraph(graphInfo, "zimage vae encoder")) return StatusCode::FAILURE;
+
+    const size_t latent_elems =
+        (size_t)zimage_latent_channels * sample_width * sample_height;
+    memcpy(mean,
+           static_cast<float *>(QNN_TENSOR_GET_CLIENT_BUF(outputs[0]).data),
+           latent_elems * sizeof(float));
+    memcpy(std_dev,
+           static_cast<float *>(QNN_TENSOR_GET_CLIENT_BUF(outputs[1]).data),
+           latent_elems * sizeof(float));
+    return StatusCode::SUCCESS;
+  }
+
+  // Qwen3-4B text encoder. Inputs: input_embedding [1,512,2560] fp32 (the
+  // host-side token_emb lookup, prompt weights already folded in) and
+  // attention_mask [1,512] fp32. Output: context [1,512,2560] fp32, which the
+  // exporter must take from hidden_states[-2] (Z-Image reads the
+  // second-to-last layer, not the final one).
+  StatusCode executeZImageTextEncoder(const float *input_embedding,
+                                      const float *attention_mask,
+                                      float *out_context) {
+    if (!ensureIoTensors()) return StatusCode::FAILURE;
+    auto graphInfo = (*m_graphsInfo)[0];
+    logGraphIoOnce("zimage", "text_encoder", graphInfo);
+
+    const size_t S = zimage_text_seq_len;
+    const size_t D = zimage_text_embedding_size;
+    if (!writeNamedFloat(graphInfo, "input_embedding", input_embedding,
+                         S * D) ||
+        !writeNamedFloat(graphInfo, "attention_mask", attention_mask, S))
+      return StatusCode::FAILURE;
+
+    if (!runGraph(graphInfo, "zimage text encoder")) return StatusCode::FAILURE;
+
+    Qnn_Tensor_t *to =
+        findTensor(outputs, graphInfo.numOutputTensors, "context");
+    if (!to) {
+      QNN_ERROR("zimage text encoder: missing output 'context'");
+      return StatusCode::FAILURE;
+    }
+    memcpy(out_context, QNN_TENSOR_GET_CLIENT_BUF(*to).data,
+           S * D * sizeof(float));
     return StatusCode::SUCCESS;
   }
 

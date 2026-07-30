@@ -282,6 +282,7 @@ class RemoteHostService : Service() {
             runOnCpu = model.runOnCpu,
             isSdxl = model.isSdxl,
             isAnima = model.isAnima,
+            isZImage = model.isZImage,
             isCustom = model.isCustom,
             generationSize = model.generationSize,
             defaults = RemoteModelDefaults(

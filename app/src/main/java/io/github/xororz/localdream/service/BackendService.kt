@@ -497,16 +497,21 @@ class BackendService : Service() {
                     File(filesDir, "safety_checker.mnn").absolutePath,
                 )
             }
-            // SDXL and Anima are the large NPU formats that benefit from
-            // per-stage load/release. They share the same backend --lowram flag
-            // but keep separate UI toggles so each can opt in independently.
+            // SDXL and the split-DiT formats are the large NPU formats that
+            // benefit from per-stage load/release. They share the same backend
+            // --lowram flag but keep separate UI toggles so each can opt in
+            // independently.
             if (backendType == "sdxl" && preferences.getBoolean("sdxl_lowram", true)) {
                 command += "--lowram"
             }
-            if (backendType == "anima" && preferences.getBoolean("anima_lowram", true)) {
+            if ((backendType == "anima" || backendType == "zimage") &&
+                preferences.getBoolean("anima_lowram", true)
+            ) {
                 command += "--lowram"
-                // Aggressive variant: never hold both DiT halves resident at
-                // once, so 12GB devices can run Anima low-RAM. Slower per step.
+                // Aggressive variant: hold only one DiT part resident at a
+                // time, so 12GB devices can run these low-RAM. Slower per step,
+                // and much more so for Z-Image, whose 6B DiT is split into more
+                // parts than Anima's two.
                 if (preferences.getBoolean("anima_seq_dit", false)) {
                     command += "--anima_seq_dit"
                 }

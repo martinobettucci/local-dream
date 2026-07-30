@@ -97,10 +97,14 @@ object TempCleaner {
         // Upscalers share the models dir; never touch them.
         if (name.startsWith("upscaler") || File(entry, "upscaler.bin").exists()) return true
         // Custom models are only listed once one of these markers is written,
-        // so a marker-less dir is an unusable, half-finished import.
+        // so a marker-less dir is an unusable, half-finished import. Keep this
+        // list in sync with ModelRepository.scanCustomModels: a marker missing
+        // here makes a perfectly good imported model look like leftover junk.
         return File(entry, "finished").exists() ||
             File(entry, "npucustom").exists() ||
-            File(entry, "SDXL").exists()
+            File(entry, "SDXL").exists() ||
+            File(entry, "ANIMA").exists() ||
+            File(entry, "ZIMAGE").exists()
     }
 
     private fun sizeOf(file: File): Long = if (file.isDirectory) {

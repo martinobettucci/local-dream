@@ -39,4 +39,36 @@ inline constexpr float anima_latent_std[16] = {
     2.8184f, 1.4541f, 2.3275f, 2.6558f, 1.2196f, 1.7708f, 2.6052f, 2.0743f,
     3.2687f, 2.1526f, 2.8652f, 1.5579f, 1.6382f, 1.1253f, 2.8251f, 1.9160f};
 
+// ---- Z-Image (S3-DiT + Qwen3-4B) constants ---------------------------------
+// From Tongyi-MAI/Z-Image-Turbo's shipped configs:
+//   transformer/config.json : ZImageTransformer2DModel, dim 3840, n_layers 30,
+//       n_heads 30, all_patch_size [2], in_channels 16, cap_feat_dim 2560,
+//       axes_dims [32,48,48], rope_theta 256.0, t_scale 1000.0
+//   vae/config.json         : AutoencoderKL "flux-dev", latent_channels 16,
+//       scaling_factor 0.3611, shift_factor 0.1159 (8x spatial downsample)
+//   scheduler/config.json   : FlowMatchEulerDiscreteScheduler, shift 3.0,
+//       num_train_timesteps 1000, use_dynamic_shifting false
+//   model_index.json        : text_encoder Qwen3Model, tokenizer Qwen2Tokenizer
+inline constexpr int zimage_latent_channels = 16;
+// Fixed context length of the exported graphs. Z-Image's reference pipeline
+// tokenizes with max_sequence_length=512 and pads to it, then drops padded rows
+// via the attention mask; a static QNN graph keeps all 512 rows and masks them
+// instead, so the padded length IS the graph's context length.
+inline constexpr int zimage_text_seq_len = 512;
+// Qwen3-4B hidden size == the DiT's cap_feat_dim.
+inline constexpr int zimage_text_embedding_size = 2560;
+// Flux VAE uses a single scalar shift/scale pair, unlike Wan's per-channel
+// table: vae_latent = model_latent / scale + shift (and the inverse to encode).
+inline constexpr float zimage_vae_scaling_factor = 0.3611f;
+inline constexpr float zimage_vae_shift_factor = 0.1159f;
+// Rectified-flow schedule. The DiT's t_scale is 1000, i.e. the timestep it
+// consumes is sigma * 1000, not sigma.
+inline constexpr float zimage_flow_shift = 3.0f;
+inline constexpr float zimage_timestep_scale = 1000.0f;
+// Upper bound on how many pieces the DiT may be exported into
+// (unet_part1.bin .. unet_partN.bin). 6B parameters do not fit one HTP context
+// at any supported weight width, so the split count is a property of the
+// converted model, discovered on disk rather than fixed here.
+inline constexpr int zimage_max_dit_parts = 16;
+
 #endif  // CONFIG_HPP

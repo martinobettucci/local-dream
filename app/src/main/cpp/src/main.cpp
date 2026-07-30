@@ -15,6 +15,7 @@
 #include "PipelineSd15Cpu.hpp"
 #include "PipelineSd15Npu.hpp"
 #include "PipelineSdxl.hpp"
+#include "PipelineZImage.hpp"
 #include "QnnRuntime.hpp"
 #include "RequestParser.hpp"
 #include "SDUtils.hpp"
@@ -46,10 +47,15 @@
 //   anima:   tokenizer.json tokenizer_t5.json token_emb.bin clip.bin
 //            unet_part1.bin unet_part2.bin vae_decoder.bin
 //            [vae_encoder.bin] (optional; enables img2img/inpaint)
-// SD15/SDXL CLIP runs on MNN (CPU); Anima's CLIP (clip.bin) runs on QNN/HTP
-// (the C++ side still does the qwen token_emb lookup -> input_embedding).
+//   zimage:  tokenizer.json token_emb.bin clip.bin
+//            unet_part1.bin .. unet_partN.bin vae_decoder.bin
+//            [vae_encoder.bin] (optional; enables img2img/inpaint)
+// SD15/SDXL CLIP runs on MNN (CPU); the DiT formats run their text encoder
+// (clip.bin) on QNN/HTP (the C++ side still does the qwen token_emb lookup ->
+// input_embedding). Z-Image's DiT part count is discovered on disk: the parts
+// are numbered from 1 and must be contiguous.
 struct ServerOptions {
-  enum class ModelType { kSd15Cpu, kSd15Npu, kSdxl, kAnima };
+  enum class ModelType { kSd15Cpu, kSd15Npu, kSdxl, kAnima, kZImage };
 
   int port = 8081;
   std::string listen_address = "127.0.0.1";
@@ -62,20 +68,21 @@ struct ServerOptions {
   bool use_v_pred = false;
   bool no_img2img = false;  // skip the VAE encoder entirely
   bool lowram = false;
-  bool anima_seq_dit = false;  // (anima+lowram) never co-resident DiT halves
+  bool anima_seq_dit = false;  // (anima/zimage+lowram) one DiT part at a time
   bool upscaler_mode = false;
   bool convert_mode = false;
   bool convert_clip_skip_2 = false;
 
   bool isSdxl() const { return type == ModelType::kSdxl; }
   bool isAnima() const { return type == ModelType::kAnima; }
+  bool isZImage() const { return type == ModelType::kZImage; }
   bool isMnn() const { return type == ModelType::kSd15Cpu; }
 };
 
 static void showHelp() {
   std::cout
       << "Usage:\n"
-         "  stable_diffusion_core --type <sd15cpu|sd15npu|sdxl> "
+         "  stable_diffusion_core --type <sd15cpu|sd15npu|sdxl|anima|zimage> "
          "--model_dir <dir> [--lib_dir <dir>] [options]\n"
          "  stable_diffusion_core --upscaler_mode [--lib_dir <dir>] "
          "[options]\n"
@@ -83,7 +90,7 @@ static void showHelp() {
          "\n"
          "Modes:\n"
          "  --type <type>          Model format: sd15cpu (MNN), sd15npu "
-         "(QNN), sdxl (QNN), anima (QNN)\n"
+         "(QNN), sdxl (QNN), anima (QNN), zimage (QNN)\n"
          "  --upscaler_mode        Upscale-only server, no diffusion model\n"
          "  --convert <dir>        Convert model.safetensors in <dir> to MNN "
          "and exit\n"
@@ -102,9 +109,10 @@ static void showHelp() {
          "  --listen_all           Listen on 0.0.0.0 instead of 127.0.0.1\n"
          "  --no_img2img           Do not load the VAE encoder\n"
          "  --use_v_pred           v-prediction model\n"
-         "  --lowram               (sdxl/anima) load/release models per stage\n"
-         "  --anima_seq_dit        (anima+lowram) never keep both DiT halves "
-         "resident; for 12GB devices\n"
+         "  --lowram               (sdxl/anima/zimage) load/release models "
+         "per stage\n"
+         "  --anima_seq_dit        (anima/zimage+lowram) hold only one DiT "
+         "part resident at a time; for 12GB devices\n"
          "  --clip_skip_2          (convert) export CLIP with skip 2\n"
          "  --log_level <n>        QNN log level\n"
          "  --version              Print QNN SDK build id\n"
@@ -238,6 +246,8 @@ static ServerOptions processCommandLine(int argc, char **argv) {
     opts.type = ServerOptions::ModelType::kSd15Npu;
   else if (typeStr == "anima")
     opts.type = ServerOptions::ModelType::kAnima;
+  else if (typeStr == "zimage")
+    opts.type = ServerOptions::ModelType::kZImage;
   else
     showHelpAndExit(typeStr.empty() ? "Missing --type"
                                     : "Invalid --type: " + typeStr);
@@ -292,6 +302,43 @@ static std::unique_ptr<Pipeline> createPipeline(const ServerOptions &opts,
   const std::filesystem::path dir(opts.model_dir);
   const bool sdxl = opts.isSdxl();
   const bool anima = opts.isAnima();
+
+  // Z-Image: Qwen3-4B text encoder (clip.bin, QNN) + an N-way split S3-DiT +
+  // 16-ch Flux VAE. The DiT part count is a property of the conversion, so the
+  // parts are discovered rather than fixed: unet_part1.bin upward, stopping at
+  // the first gap.
+  if (opts.isZImage()) {
+    std::string clip_path = (dir / "clip.bin").string();
+    std::string vae_decoder_path = (dir / "vae_decoder.bin").string();
+    std::string vae_encoder_path =
+        opts.no_img2img ? "" : (dir / "vae_encoder.bin").string();
+
+    std::vector<std::string> dit_parts;
+    for (int i = 1; i <= zimage_max_dit_parts; ++i) {
+      auto p = dir / ("unet_part" + std::to_string(i) + ".bin");
+      if (!std::filesystem::exists(p)) break;
+      dit_parts.push_back(p.string());
+    }
+    if (dit_parts.empty())
+      showHelpAndExit("File not found: " +
+                      (dir / "unet_part1.bin").string() +
+                      " (zimage needs at least one DiT part)");
+    QNN_INFO("zimage: found %zu DiT part(s)", dit_parts.size());
+
+    std::vector<std::string> required = {
+        (dir / "tokenizer.json").string(),
+        (dir / "token_emb.bin").string(),
+        clip_path,
+        vae_decoder_path,
+    };
+    if (!vae_encoder_path.empty()) required.push_back(vae_encoder_path);
+    for (const auto &p : required) {
+      if (!std::filesystem::exists(p)) showHelpAndExit("File not found: " + p);
+    }
+    return std::make_unique<PipelineZImage>(
+        text_encoder, opts.model_dir, clip_path, std::move(dit_parts),
+        vae_decoder_path, vae_encoder_path, opts.lowram, opts.anima_seq_dit);
+  }
 
   // Anima: Qwen "CLIP" (clip.bin, QNN) + split DiT (unet_part1/2.bin) + 16-ch
   // VAE. The Qwen text encoder uses RoPE internally, so there is no
@@ -392,7 +439,8 @@ static void registerGenerateEndpoint(httplib::Server &svr, Pipeline *pipeline) {
     try {
       auto json = nlohmann::json::parse(request.body);
       auto req = std::make_shared<GenerationRequest>(parseGenerationRequest(
-          json, pipeline->isSdxl(), pipeline->isAnima(),
+          json, pipeline->isSdxl(),
+          pipeline->isAnima() || pipeline->isZImage(),
           pipeline->supportsImg2Img(), pipeline->supportsUltrafix()));
 
       std::cout << "Req Rcvd: P:" << req->prompt
@@ -660,9 +708,12 @@ static void registerTokenizeEndpoint(httplib::Server &svr,
     try {
       auto json = nlohmann::json::parse(req.body);
       std::string text = json.value("prompt", std::string());
-      // Anima counts with the T5 tokenizer against the context length (512),
-      // far longer than CLIP's 77.
-      const int max_len = text_encoder->isAnima() ? anima_text_seq_len : 77;
+      // The DiT formats count against their 512-token context rather than
+      // CLIP's 77: Anima with the T5 tokenizer, Z-Image with Qwen's (minus the
+      // chat-template overhead, handled inside tokenizeInfo).
+      const int max_len = text_encoder->isZImage() ? zimage_text_seq_len
+                          : text_encoder->isAnima() ? anima_text_seq_len
+                                                    : 77;
 
       TokenizeInfo info = text_encoder->tokenizeInfo(text, max_len);
 
@@ -704,7 +755,8 @@ int main(int argc, char **argv) {
     if (!opts.lib_dir.empty() && !qnn_runtime::init(opts.lib_dir))
       showHelpAndExit("Failed get QNN system func ptrs.");
   } else {
-    text_encoder = std::make_unique<TextEncoder>(opts.isSdxl(), opts.isAnima());
+    text_encoder = std::make_unique<TextEncoder>(opts.isSdxl(), opts.isAnima(),
+                                                 opts.isZImage());
     try {
       const std::filesystem::path mdir(opts.model_dir);
       text_encoder->loadTokenizer((mdir / "tokenizer.json").string());

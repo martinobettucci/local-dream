@@ -124,11 +124,12 @@ struct TokenizeInfo {
 // encoder 2).
 class TextEncoder {
  public:
-  explicit TextEncoder(bool sdxl, bool anima = false)
-      : sdxl_(sdxl), anima_(anima) {}
+  explicit TextEncoder(bool sdxl, bool anima = false, bool zimage = false)
+      : sdxl_(sdxl), anima_(anima), zimage_(zimage) {}
 
   bool isSdxl() const { return sdxl_; }
   bool isAnima() const { return anima_; }
+  bool isZImage() const { return zimage_; }
   tokenizers::Tokenizer *tokenizer() { return tokenizer_.get(); }
 
   void loadTokenizer(const std::string &path) {
@@ -151,7 +152,9 @@ class TextEncoder {
   void loadEmbeddingTables(const std::filesystem::path &dir) {
     // Anima/Qwen uses RoPE inside the transformer -> there is no positional
     // table; only the fp16 token-embedding table (vocab x 1024) is needed.
-    if (anima_) {
+    // Z-Image's Qwen3-4B is RoPE-based too; same single-table layout as Anima,
+    // just wider (vocab x 2560 instead of vocab x 1024).
+    if (anima_ || zimage_) {
       loadTokenEmb(dir / "token_emb.bin", token_emb_, /*force_fp16=*/true);
       return;
     }
@@ -363,15 +366,99 @@ class TextEncoder {
     return result;
   }
 
+  // Z-Image / Qwen3-4B. The reference pipeline does not feed the bare prompt to
+  // the text encoder: it runs the prompt through Qwen3's chat template with
+  // add_generation_prompt=True and enable_thinking=True, which wraps it as
+  //
+  //   <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
+  //
+  // (enable_thinking=True is the branch that does NOT inject an empty
+  // <think></think> block). tokenizers-cpp matches the added tokens straight
+  // out of tokenizer.json, so the template is applied here as literal text
+  // rather than needing template support in the tokenizer.
+  //
+  // The wrapped ids are padded to zimage_text_seq_len with Qwen's pad id and
+  // looked up in the fp16 token-embedding table; the mask marks the real rows.
+  // Both the exported graph's causal attention and the DiT's caption attention
+  // consume that mask, which is why it travels with the hidden states rather
+  // than being baked into either graph.
+  //
+  // Prompt weighting works as it does for Anima: promptProcessor_ strips the
+  // "(word:1.2)" / "[word]" markers (the tokenizer never sees them) and each
+  // token's weight scales its input_embedding row. Textual inversions are not
+  // supported — a trigger word degrades to its literal text.
+  ProcessedPrompt processZImagePrompt(const std::string &prompt_text) {
+    ProcessedPrompt result;
+    const int dim = zimage_text_embedding_size;  // 2560
+    const int seq = zimage_text_seq_len;         // 512
+
+    std::vector<int> ids;
+    std::vector<float> weights;
+    ids.reserve(seq);
+    weights.reserve(seq);
+
+    auto append = [&](const std::vector<int> &enc, float w) {
+      for (int id : enc) {
+        ids.push_back(id);
+        weights.push_back(w);
+      }
+    };
+
+    const std::vector<int> prefix = tokenizer_->Encode(kZImageTemplatePrefix);
+    const std::vector<int> suffix = tokenizer_->Encode(kZImageTemplateSuffix);
+    // Truncation has to leave room for the generation prompt: dropping the
+    // trailing "<|im_end|>\n<|im_start|>assistant\n" would hand the encoder an
+    // unterminated turn and shift every hidden state. An over-long prompt loses
+    // its own tail instead.
+    const int body_budget = seq - (int)prefix.size() - (int)suffix.size();
+    if (body_budget < 0)
+      throw std::runtime_error("zimage: context too short for chat template");
+
+    append(prefix, 1.0f);
+    const int body_start = (int)ids.size();
+    for (const auto &token : promptProcessor_.process(prompt_text)) {
+      if ((int)ids.size() - body_start >= body_budget) break;
+      for (int id : tokenizer_->Encode(token.text)) {
+        if ((int)ids.size() - body_start >= body_budget) break;
+        ids.push_back(id);
+        weights.push_back(token.weight);
+      }
+    }
+    append(suffix, 1.0f);
+
+    std::vector<float> embeddings((size_t)seq * dim, 0.0f);
+    std::vector<int> padded_ids(seq, kQwenPadId);
+    std::vector<float> mask(seq, 0.0f);
+    for (int pos = 0; pos < seq; ++pos) {
+      const bool real = pos < (int)ids.size();
+      const int id = real ? ids[pos] : kQwenPadId;
+      const float w = real ? weights[pos] : 1.0f;
+      padded_ids[pos] = id;
+      mask[pos] = real ? 1.0f : 0.0f;
+      const size_t base = (size_t)id * dim;
+      for (int j = 0; j < dim; ++j)
+        embeddings[(size_t)pos * dim + j] =
+            fp16_to_fp32(token_emb_[base + j]) * w;
+    }
+
+    result.ids = std::move(padded_ids);
+    result.weighted_embeddings = std::move(embeddings);
+    result.qwen_mask = std::move(mask);
+    return result;
+  }
+
   ProcessedPromptPair processPromptPair(const std::string &positive,
                                         const std::string &negative,
                                         int max_len = 77) {
     ProcessedPromptPair result;
 
-    auto pos_result = anima_ ? processAnimaPrompt(positive, max_len)
-                             : processWeightedPrompt(positive, max_len);
-    auto neg_result = anima_ ? processAnimaPrompt(negative, max_len)
-                             : processWeightedPrompt(negative, max_len);
+    auto run_side = [&](const std::string &text) {
+      if (zimage_) return processZImagePrompt(text);
+      if (anima_) return processAnimaPrompt(text, max_len);
+      return processWeightedPrompt(text, max_len);
+    };
+    auto pos_result = run_side(positive);
+    auto neg_result = run_side(negative);
 
     result.ids.reserve(2 * max_len);
     result.ids.insert(result.ids.end(), neg_result.ids.begin(),
@@ -384,9 +471,12 @@ class TextEncoder {
     result.negative_embeddings_2 = neg_result.weighted_embeddings_2;
     result.positive_embeddings_2 = pos_result.weighted_embeddings_2;
 
-    if (anima_) {
+    // Z-Image reuses qwen_mask for its one attention mask and has no T5 side.
+    if (anima_ || zimage_) {
       result.negative_qwen_mask = std::move(neg_result.qwen_mask);
       result.positive_qwen_mask = std::move(pos_result.qwen_mask);
+    }
+    if (anima_) {
       result.negative_t5_ids = std::move(neg_result.t5_ids);
       result.positive_t5_ids = std::move(pos_result.t5_ids);
       result.negative_t5_mask = std::move(neg_result.t5_mask);
@@ -402,6 +492,31 @@ class TextEncoder {
   TokenizeInfo tokenizeInfo(const std::string &text, int max_len = 77) {
     TokenizeInfo info;
     if (!tokenizer_) return info;
+
+    // Z-Image: the chat-template wrapper occupies part of the 512-token
+    // context, so the user's own budget is what remains after the prefix and
+    // the (never-truncated) generation-prompt suffix.
+    if (zimage_) {
+      const int overhead =
+          (int)tokenizer_->Encode(kZImageTemplatePrefix).size() +
+          (int)tokenizer_->Encode(kZImageTemplateSuffix).size();
+      const int budget = max_len - overhead;
+      int content = 0;
+      for (const auto &token : promptProcessor_.process(text)) {
+        int tc = static_cast<int>(tokenizer_->Encode(token.text).size());
+        if (info.overflow_offset < 0 && content + tc > budget) {
+          size_t prefix_bytes = prefixBytesWithinBudget(
+              token.text, budget - content, tokenizer_.get());
+          size_t byte_off = (prefix_bytes < token.char_src.size())
+                                ? token.char_src[prefix_bytes]
+                                : token.source_start;
+          info.overflow_offset = utf8ByteOffsetToUtf16(text, byte_off);
+        }
+        content += tc;
+      }
+      info.count = content + overhead;
+      return info;
+    }
 
     // Anima: the UNet context length follows the T5 tokenization (the LLM
     // adapter's query grid), NOT the Qwen embedding side, so the prompt budget
@@ -572,8 +687,15 @@ class TextEncoder {
   static constexpr int kT5EosId = 1;
   static constexpr int kT5PadId = 0;
 
+  // Qwen3 chat template, add_generation_prompt=True + enable_thinking=True, as
+  // Z-Image's reference pipeline applies it before tokenizing.
+  static constexpr const char *kZImageTemplatePrefix = "<|im_start|>user\n";
+  static constexpr const char *kZImageTemplateSuffix =
+      "<|im_end|>\n<|im_start|>assistant\n";
+
   bool sdxl_ = false;
   bool anima_ = false;
+  bool zimage_ = false;
   std::shared_ptr<tokenizers::Tokenizer> tokenizer_;
   std::shared_ptr<tokenizers::Tokenizer> t5_tokenizer_;
   PromptProcessor promptProcessor_;

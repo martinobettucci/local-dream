@@ -22,6 +22,11 @@ constexpr uint32_t kModeSdxl = 1;
 // Anima (Qwen text encoder): 512-token context, no pooled output. Its own mode
 // keeps its files from ever colliding with a 77-token CLIP cache entry.
 constexpr uint32_t kModeAnima = 2;
+// Z-Image (Qwen3-4B): 512-token context of 2560-dim hidden states. It has no
+// pooled vector either, and reuses the pooled slot to persist the 512-entry
+// caption attention mask alongside the hidden states — the DiT needs both, so
+// caching one without the other would be useless.
+constexpr uint32_t kModeZImage = 3;
 
 struct Header {
   char magic[4];

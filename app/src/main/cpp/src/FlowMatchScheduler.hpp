@@ -30,19 +30,49 @@
 
 class FlowMatchScheduler : public Scheduler {
  public:
+  // Which sigma schedule to build. The two ecosystems shift differently and
+  // the gap is not cosmetic — at 8 steps the final sigma differs by ~3x.
+  //
+  //   kComfyNormal      ComfyUI's normal_scheduler over
+  //                     ModelSamplingDiscreteFlow. It linspaces between the
+  //                     ALREADY-shifted sigma_max and sigma_min and then
+  //                     shifts again, so the shift lands twice. This is what
+  //                     Anima was tuned against.
+  //   kDiffusersLinear  diffusers' FlowMatchEulerDiscreteScheduler: linspace
+  //                     over the raw range [1, 1/num_train_timesteps], shifted
+  //                     once. Z-Image ships exactly this scheduler config.
+  enum class SigmaSchedule { kComfyNormal, kDiffusersLinear };
+
   // eta = 1.0 -> stochastic ancestral euler ("euler_ancestral"); eta = 0.0 ->
   // deterministic euler. Anima's reference pipeline defaults to ancestral.
-  explicit FlowMatchScheduler(float shift = 3.0f, float multiplier = 1.0f,
-                              float eta = 1.0f, float s_noise = 1.0f)
-      : shift_(shift), multiplier_(multiplier), eta_(eta), s_noise_(s_noise) {}
+  //
+  // timestep_scale is the model's t_scale: the value handed to the network is
+  // sigma * timestep_scale. Anima's graph consumes the raw sigma (1.0);
+  // Z-Image's DiT declares t_scale 1000.0, matching diffusers'
+  // FlowMatchEulerDiscreteScheduler, whose timesteps are sigma *
+  // num_train_timesteps. Only the reported timestep is affected — the sigmas
+  // driving the update rule stay in (0, 1] either way.
+  explicit FlowMatchScheduler(
+      float shift = 3.0f, float multiplier = 1.0f, float eta = 1.0f,
+      float s_noise = 1.0f, float timestep_scale = 1.0f,
+      SigmaSchedule schedule = SigmaSchedule::kComfyNormal)
+      : shift_(shift),
+        multiplier_(multiplier),
+        eta_(eta),
+        s_noise_(s_noise),
+        timestep_scale_(timestep_scale),
+        schedule_(schedule) {}
 
   void set_timesteps(int num_inference_steps) override {
     num_inference_steps_ = num_inference_steps;
     auto sigs = build_sigmas(num_inference_steps);
     sigmas_ = xt::adapt(sigs);  // length N+1, trailing 0
-    // The model timestep equals sigma (multiplier = 1.0). The loop iterates
-    // over timesteps_, one entry per non-terminal sigma.
-    std::vector<float> ts(sigs.begin(), sigs.end() - 1);
+    // The model timestep is sigma * t_scale. The loop iterates over
+    // timesteps_, one entry per non-terminal sigma.
+    std::vector<float> ts;
+    ts.reserve(sigs.size() - 1);
+    for (size_t i = 0; i + 1 < sigs.size(); ++i)
+      ts.push_back(sigs[i] * timestep_scale_);
     timesteps_ = xt::adapt(ts);
     step_index_ = std::nullopt;
     begin_index_ = std::nullopt;
@@ -125,9 +155,27 @@ class FlowMatchScheduler : public Scheduler {
     return alpha * t / (1.0f + (alpha - 1.0f) * t);
   }
 
+  // diffusers FlowMatchEulerDiscreteScheduler.set_timesteps: linspace the raw
+  // sigmas over [1, 1/num_train_timesteps] and apply the SNR shift once.
+  // Returns length steps+1 (descending sigmas, trailing 0).
+  std::vector<float> build_sigmas_diffusers(int steps) const {
+    constexpr float kNumTrainTimesteps = 1000.0f;
+    const float lo = 1.0f / kNumTrainTimesteps;
+    std::vector<float> sigs;
+    sigs.reserve(steps + 1);
+    for (int i = 0; i < steps; ++i) {
+      float s = (steps == 1)
+                    ? 1.0f
+                    : 1.0f + (lo - 1.0f) * float(i) / float(steps - 1);
+      sigs.push_back(time_snr_shift(shift_, s));
+    }
+    sigs.push_back(0.0f);
+    return sigs;
+  }
+
   // Mirrors anima_torch.sampler.build_sigmas (ComfyUI normal_scheduler for
   // flow-matching). Returns length steps+1 (descending sigmas, trailing 0).
-  std::vector<float> build_sigmas(int steps) const {
+  std::vector<float> build_sigmas_comfy(int steps) const {
     // sigma(ts) = time_snr_shift(shift, ts/multiplier); timestep(sigma)=sigma.
     auto sigma_of = [&](float ts) {
       return time_snr_shift(shift_, ts / multiplier_);
@@ -154,12 +202,20 @@ class FlowMatchScheduler : public Scheduler {
     return sigs;
   }
 
+  std::vector<float> build_sigmas(int steps) const {
+    return schedule_ == SigmaSchedule::kDiffusersLinear
+               ? build_sigmas_diffusers(steps)
+               : build_sigmas_comfy(steps);
+  }
+
   void init_step_index() { step_index_ = begin_index_.value_or(0); }
 
   float shift_;
   float multiplier_;
   float eta_;
   float s_noise_;
+  float timestep_scale_;
+  SigmaSchedule schedule_;
 
   std::optional<int> num_inference_steps_;
   xt::xarray<float> sigmas_;     // length N+1

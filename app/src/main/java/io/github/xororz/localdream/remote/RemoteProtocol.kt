@@ -97,6 +97,7 @@ data class RemoteModelInfo(
     val runOnCpu: Boolean,
     val isSdxl: Boolean,
     val isAnima: Boolean,
+    val isZImage: Boolean,
     val isCustom: Boolean,
     val generationSize: Int,
     val defaults: RemoteModelDefaults,
@@ -111,6 +112,7 @@ data class RemoteModelInfo(
         put("run_on_cpu", runOnCpu)
         put("is_sdxl", isSdxl)
         put("is_anima", isAnima)
+        put("is_zimage", isZImage)
         put("is_custom", isCustom)
         put("generation_size", generationSize)
         put("defaults", defaults.toJson())
@@ -148,6 +150,9 @@ data class RemoteModelInfo(
                 runOnCpu = json.optBoolean("run_on_cpu", false),
                 isSdxl = json.optBoolean("is_sdxl", false),
                 isAnima = json.optBoolean("is_anima", false),
+                // Older hosts don't send this; they simply have no Z-Image
+                // models to list, so defaulting to false is correct.
+                isZImage = json.optBoolean("is_zimage", false),
                 isCustom = json.optBoolean("is_custom", false),
                 generationSize = json.optInt("generation_size", 512),
                 defaults = RemoteModelDefaults.fromJson(

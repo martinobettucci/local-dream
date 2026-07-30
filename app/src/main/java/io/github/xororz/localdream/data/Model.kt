@@ -124,22 +124,24 @@ data class Model(
     val isCustom: Boolean = false,
     val isSdxl: Boolean = false,
     val isAnima: Boolean = false,
+    val isZImage: Boolean = false,
 
 ) {
     // Per-field priority: code defaults > config.json > global defaults.
     val defaults: GenerationDefaults
         get() = codeDefaults.withFallback(configDefaults).resolve()
 
-    // SDXL and Anima both render on a fixed 1024 canvas and reach non-1:1
-    // outputs via aspect-ratio inpaint padding; the run screen treats them
-    // alike for default size and aspect-ratio handling (ultrafix stays
+    // SDXL, Anima and Z-Image all render on a fixed 1024 canvas and reach
+    // non-1:1 outputs via aspect-ratio inpaint padding; the run screen treats
+    // them alike for default size and aspect-ratio handling (ultrafix stays
     // SDXL-only). SD1.5 NPU/CPU use their own sizes / resolution patches.
     val usesFixedCanvas: Boolean
-        get() = isSdxl || isAnima
+        get() = isSdxl || isAnima || isZImage
 
     // Backend --type value; each type implies the full model file layout.
     val backendType: String
         get() = when {
+            isZImage -> "zimage"
             isAnima -> "anima"
             isSdxl -> "sdxl"
             runOnCpu -> "sd15cpu"
@@ -462,8 +464,12 @@ class ModelRepository private constructor(private val context: Context) {
                 val npuCustomFile = File(dir, "npucustom")
                 val sdxlFile = File(dir, "SDXL")
                 val animaFile = File(dir, "ANIMA")
+                val zimageFile = File(dir, "ZIMAGE")
 
                 when {
+                    zimageFile.exists() ->
+                        customModels.add(createCustomModel(dir, isNpu = true, isZImage = true))
+
                     animaFile.exists() ->
                         customModels.add(createCustomModel(dir, isNpu = true, isAnima = true))
 
@@ -482,15 +488,36 @@ class ModelRepository private constructor(private val context: Context) {
         return customModels.sortedBy { it.name.lowercase() }
     }
 
-    private fun createCustomModel(modelDir: File, isNpu: Boolean = false, isSdxl: Boolean = false, isAnima: Boolean = false): Model {
+    private fun createCustomModel(
+        modelDir: File,
+        isNpu: Boolean = false,
+        isSdxl: Boolean = false,
+        isAnima: Boolean = false,
+        isZImage: Boolean = false,
+    ): Model {
         val modelId = modelDir.name
         // Imported models have no code-level defaults: config.json (if
         // bundled in the zip) wins, the generic placeholder prompts below
         // only fill what it leaves unset.
-        val placeholders = ModelConfig(
-            prompt = "masterpiece, best quality, a cat sat on a mat,",
-            negativePrompt = "lowres, bad anatomy, bad hands, missing fingers, extra fingers, bad arms, missing legs, missing arms, poorly drawn face, bad face, fused face, cloned face, three crus, fused feet, fused thigh, extra crus, ugly fingers, horn, huge eyes, worst face, 2girl, long fingers, disconnected limbs,",
-        )
+        val placeholders = if (isZImage) {
+            // Z-Image Turbo is distilled to 8 steps and trained guidance-free,
+            // so cfg stays at 1.0 — which also means the negative prompt is
+            // never evaluated (the backend skips the unconditional pass), hence
+            // the empty default. It takes natural-language prompts rather than
+            // booru tags, and its shipped scheduler is deterministic Euler.
+            ModelConfig(
+                prompt = "A cat sitting on a woven mat by a sunlit window, photorealistic.",
+                negativePrompt = "",
+                steps = 8f,
+                cfg = 1f,
+                scheduler = "euler",
+            )
+        } else {
+            ModelConfig(
+                prompt = "masterpiece, best quality, a cat sat on a mat,",
+                negativePrompt = "lowres, bad anatomy, bad hands, missing fingers, extra fingers, bad arms, missing legs, missing arms, poorly drawn face, bad face, fused face, cloned face, three crus, fused feet, fused thigh, extra crus, ugly fingers, horn, huge eyes, worst face, 2girl, long fingers, disconnected limbs,",
+            )
+        }
         val config = ModelConfig.read(modelDir) ?: ModelConfig()
 
         return Model(
@@ -498,7 +525,7 @@ class ModelRepository private constructor(private val context: Context) {
             name = modelId,
             description = context.getString(R.string.custom_model),
             baseUrl = "",
-            generationSize = if (isSdxl || isAnima) 1024 else 512,
+            generationSize = if (isSdxl || isAnima || isZImage) 1024 else 512,
             approximateSize = "Custom",
             isDownloaded = true,
             configDefaults = config.withFallback(placeholders),
@@ -506,6 +533,7 @@ class ModelRepository private constructor(private val context: Context) {
             isCustom = true,
             isSdxl = isSdxl,
             isAnima = isAnima,
+            isZImage = isZImage,
         )
     }
 

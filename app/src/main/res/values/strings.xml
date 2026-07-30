@@ -34,10 +34,10 @@
     <string name="tag_import_failed">Import failed</string>
     <string name="sdxl_lowram">SDXL low RAM mode</string>
     <string name="sdxl_lowram_hint">For SDXL only: load each model on demand and free it after use. Required on devices with less than 16GB RAM. Disables in-progress preview.</string>
-    <string name="anima_lowram">Anima low RAM mode</string>
-    <string name="anima_lowram_hint">For Anima only: load each model on demand and free it after use. Required on devices with less than 16GB RAM. Disables in-progress preview.</string>
-    <string name="anima_seq_dit">Anima DiT sequential loading</string>
-    <string name="anima_seq_dit_hint">Only with Anima low RAM mode: never keep both DiT halves in memory at the same time. Enable this if you have 12GB RAM but Anima low RAM mode still cannot run. Slower per step.</string>
+    <string name="anima_lowram">DiT low RAM mode</string>
+    <string name="anima_lowram_hint">For Anima and Z-Image only: load each model on demand and free it after use. Required on devices with less than 16GB RAM. Disables in-progress preview.</string>
+    <string name="anima_seq_dit">DiT sequential loading</string>
+    <string name="anima_seq_dit_hint">Only with DiT low RAM mode: keep just one DiT part in memory at a time. Enable this if you have 12GB RAM but low RAM mode still cannot run. Slower per step, and much slower for Z-Image, whose DiT is split into more parts.</string>
     <string name="captured_logs_title">Captured logs</string>
     <string name="log_saved">Saved to %1$s</string>
     <string name="log_save_failed">Failed to save log</string>
