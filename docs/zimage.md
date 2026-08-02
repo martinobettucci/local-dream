@@ -325,3 +325,70 @@ reads `RELEASE_STORE_FILE`, `RELEASE_STORE_PASSWORD`, `RELEASE_KEY_ALIAS` and
 just want something installable.
 
 Only `arm64-v8a` is built — the QNN backend has no other target.
+
+---
+
+## 9. Conversion notes (verified)
+
+Findings from actually setting the toolchain up, rather than from reasoning
+about it. Several correct earlier assumptions in this file's history.
+
+**The SDK is publicly downloadable.** The *Qualcomm AI Runtime Community*
+edition needs no Qualcomm account:
+
+```
+https://softwarecenter.qualcomm.com/api/download/software/sdks/\
+Qualcomm_AI_Runtime_Community/All/2.39.0.250926/v2.39.0.250926.zip
+```
+
+1.35 GB, unpacks to 3.1 GB at `qairt/2.39.0.250926/` — exactly the layout
+`CMakeLists.txt` expects. It contains the complete conversion toolchain
+(`qairt-converter`, `qnn-onnx-converter`, `qnn-context-binary-generator`,
+`qnn-model-lib-generator`, `qnn-net-run`), the `examples/QNN/SampleApp`
+sources the app builds against, `lib/aarch64-android/libQnn*`, and Hexagon
+v66–v81. Nothing about conversion needs a GPU: the converter and the context
+binary generator are host CPU compilers, and w4a16 calibration runs the ONNX
+graph through onnxruntime on CPU.
+
+**RoPE must be de-complexified before export.** `RopeEmbedder` builds its
+frequencies with `torch.polar(...) -> complex64` and the attention processor
+applies them via `view_as_complex` / `view_as_real`. ONNX has no complex tensor
+type, so export dies with `ScalarType ComplexFloat is an unexpected tensor
+scalar type` *after* tracing the entire graph — which reads like an obscure
+serialization bug rather than what it is.
+
+`tools/zimage/rope_real.py` swaps in the algebraically identical real form:
+
+```
+(x0 + i*x1) * (cos + i*sin) = (x0*cos - x1*sin) + i*(x0*sin + x1*cos)
+```
+
+`freqs_cis` then carries a trailing dim of 2 holding `(cos, sin)` instead of
+being complex; all other shapes are unchanged. `tools/zimage/verify_rope.py`
+checks it on a tiny random-weight model in a few seconds — measured agreement
+is `8.3e-07`, i.e. float32 noise. Run it after any diffusers bump.
+
+**The forward is list-based and still needs a static wrapper.** With RoPE
+fixed, export gets one step further and stops at
+`aten::pad_sequence`. `ZImageTransformer2DModel.forward` takes
+`list[Tensor]` for both latents and captions and packs variable-length
+sequences, which cannot become a static graph. Since this runner always
+generates at batch 1, a fixed 512-token caption and a fixed 1024x1024 canvas,
+every length is a compile-time constant, so `patchify_and_embed` and `forward`
+can be reimplemented for fixed shapes — that wrapper is what section 4's IO
+contract describes, and it is the remaining piece of export work.
+
+Two shape facts worth knowing before writing it: latents are `(C, F, H, W)`
+with `F = 1` for stills (the three RoPE axes are t/h/w), and the caption is
+padded to a multiple of `SEQ_MULTI_OF` with position ids starting at t=1, the
+image tokens then starting at `cap_len + 1`.
+
+**Disk.** The released transformer is fp32, not bf16: 24.6 GB across three
+shards, plus 8.05 GB for the Qwen3-4B text encoder and 0.17 GB for the VAE —
+33 GB before any ONNX intermediate. Converting on a 30 GB volume means
+downloading shard by shard, casting to fp16, writing out per-part weights and
+deleting each shard as you go.
+
+**Validation.** None of this can be checked without a Snapdragon device. A
+converted model that loads and produces an image still needs comparing against
+the reference pipeline before it is worth publishing.
