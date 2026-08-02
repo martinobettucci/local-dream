@@ -212,7 +212,13 @@ def main():
         n = pi + 1
         if args.only and n != args.only:
             continue
-        out = os.path.join(odir, f"unet_part{n}.onnx")
+        # Each part gets its own directory: parts above 2 GB are written in
+        # ONNX external-data format, whose side files are named after the
+        # tensors ("onnx__MatMul_1034") with no part prefix — two parts sharing
+        # a directory would overwrite each other's weights.
+        pdir = os.path.join(odir, f"part{n}")
+        os.makedirs(pdir, exist_ok=True)
+        out = os.path.join(pdir, f"unet_part{n}.onnx")
         if os.path.exists(out):
             log(f"part{n} already exported, skipping")
             manifest.append({"part": n, "blocks": [a, b], "onnx": out})
@@ -222,8 +228,7 @@ def main():
                           b - a, first=(pi == 0), last=(pi == len(cuts) - 1))
         log(f"  exporting -> {out}")
         export_part(part, out)
-        size = sum(os.path.getsize(os.path.join(odir, f)) for f in os.listdir(odir)
-                   if f.startswith(f"unet_part{n}"))
+        size = sum(os.path.getsize(os.path.join(pdir, f)) for f in os.listdir(pdir))
         log(f"  part{n} onnx {size / 1e9:.2f} GB")
         manifest.append({"part": n, "blocks": [a, b], "onnx": out,
                          "inputs": part.input_names, "outputs": part.output_names})

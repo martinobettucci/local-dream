@@ -104,17 +104,34 @@ class StaticZImageDiT(nn.Module):
         self.last = (self.block_end == n_layers) if last is None else bool(last)
 
     # -- pieces ------------------------------------------------------------
+    # The obvious transcription of _patchify_image / unpatchify is a 7-D view
+    # plus a fully interleaved permute. QNN rejects that outright:
+    #     Failed to resolve 6D tensor by merging consecutive axes for Transpose
+    #     with permutation [6, 0, 3, 1, 4, 2, 5]
+    # It caps tensors at 5-D and can only reduce rank by merging axes that stay
+    # adjacent, which an interleaved permutation never allows. pixel_unshuffle /
+    # pixel_shuffle express exactly the same rearrangement in <=4-D and lower to
+    # SpaceToDepth / DepthToSpace, which the HTP handles natively.
+    #
+    # Ordering note: pixel_(un)shuffle uses CRD — channel-major, then the two
+    # block axes — whereas a Z-Image token is laid out (pH, pW, C). The extra
+    # reshape/permute pair converts between the two.
+
     def _patchify(self, sample):
-        # (1, C, H, W) -> (1, n_img, pF*pH*pW*C), mirroring _patchify_image at F=1.
-        x = sample.reshape(self.C, 1, self.fp, self.grid_h, self.p, self.grid_w, self.p)
-        x = x.permute(1, 3, 5, 2, 4, 6, 0)       # F_t, H_t, W_t, pF, pH, pW, C
-        return x.reshape(1, self.n_img, self.fp * self.p * self.p * self.C)
+        # (1, C, H, W) -> (1, n_img, pH*pW*C) with per-token layout (pH, pW, C)
+        p, c = self.p, self.C
+        x = torch.nn.functional.pixel_unshuffle(sample, p)   # [1, C*p*p, gh, gw]
+        x = x.reshape(1, c, p * p, self.n_img)               # CRD: (C, pH*pW)
+        x = x.permute(0, 3, 2, 1)                            # [1, n_img, p*p, C]
+        return x.reshape(1, self.n_img, p * p * c)
 
     def _unpatchify(self, tokens):
-        # (1, n_img, p*p*C) -> (1, C, H, W)
-        x = tokens.reshape(1, self.grid_h, self.grid_w, self.fp, self.p, self.p, self.C)
-        x = x.permute(6, 0, 3, 1, 4, 2, 5)       # C, F_t, pF, H_t, pH, W_t, pW
-        return x.reshape(1, self.C, self.H, self.W)
+        # exact inverse of _patchify
+        p, c = self.p, self.C
+        x = tokens.reshape(1, self.n_img, p * p, c)
+        x = x.permute(0, 3, 2, 1)                            # [1, C, p*p, n_img]
+        x = x.reshape(1, c * p * p, self.grid_h, self.grid_w)
+        return torch.nn.functional.pixel_shuffle(x, p)       # [1, C, H, W]
 
     def _embed(self, sample, timestep, context, freqs, mask, cap_pad_mask):
         """Everything part 1 does before the main blocks."""

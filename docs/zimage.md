@@ -487,6 +487,30 @@ coordinates on top — so for any caption that is not already a multiple of 32,
 `pos_ids` comes out longer than the padded features. Do not copy that shape
 arithmetic verbatim; derive the coordinates as this runner does.
 
+**Environment: three non-obvious prerequisites.** `tools/zimage/setup_qnn_env.sh`
+automates these; each one fails with an error that does not name its cause.
+
+| Symptom | Cause |
+|---|---|
+| `ImportError: libc++.so.1: cannot open shared object file`, then a bogus "circular import" traceback | The SDK links LLVM's C++ runtime, which Community does not bundle and Ubuntu does not install. `apt install libc++1 libc++abi1`. |
+| `ImportError: Python version mismatch: module was compiled for Python 3.10` | `libDlModelToolsPy.so` is built for **3.10 exactly**. 3.11 and 3.12 both fail. Keep this venv separate from the torch/ONNX export env. |
+| `AttributeError: 'NoneType' object has no attribute 'AttributeProto'` | The converter imports `onnx.mapping`, removed in onnx 1.16. The SDK swallows the ImportError, leaves the module `None`, and dies much later. Pin **onnx < 1.16** (1.15.0 works). |
+
+**QNN caps tensors at 5-D, and the obvious patchify is 7-D.** Transcribing
+`_patchify_image` / `unpatchify` literally gives a 7-D view plus a fully
+interleaved permute, which the converter rejects:
+
+    Failed to resolve 6D tensor by merging consecutive axes for Transpose
+    with permutation [6, 0, 3, 1, 4, 2, 5]
+
+It only reduces rank by merging axes that remain adjacent, which an interleaved
+permutation never permits. `static_export.py` expresses the identical
+rearrangement with `pixel_unshuffle` / `pixel_shuffle` in <=4-D — these lower to
+SpaceToDepth / DepthToSpace, which the HTP handles natively. Verified bit-equal
+to the 7-D form in both directions. Mind the ordering: pixel_(un)shuffle is CRD
+(channel-major) while a Z-Image token is `(pH, pW, C)`, so a reshape/permute
+pair converts between them.
+
 **Validation.** None of this can be checked without a Snapdragon device. A
 converted model that loads and produces an image still needs comparing against
 the reference pipeline before it is worth publishing.
