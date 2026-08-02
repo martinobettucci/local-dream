@@ -35,20 +35,28 @@ inversion (Qwen3's embedding space is not CLIP's), and LoRA.
 
 ## 2. About "Q2"
 
-**Correction: 2-bit weights ARE supported.** An earlier version of this
-document said the HTP had no 2-bit weight format and that a "Q2" build was
-impossible. That was wrong. `qairt-quantizer --weights_bitwidth` documents its
-accepted values as "either 2, 4, 8 (default) or 16", so w2a16 converts. What is
-still unverified is whether the HTP executes it acceptably and what the quality
-cost is — neither has been measured here.
+This has been wrong twice. First it said 2-bit was impossible; then it said
+2-bit was supported and would halve the size again. **Both were reasoning from
+the `--help` text rather than from an artifact.** Section 10 has the measurement
+that settles it, and the short version is:
+
+`--weights_bitwidth 2` is accepted, converts, and passes Hexagon v73 op
+validation — but it produces a DLC **byte-identical** to `--weights_bitwidth 4`,
+because the bit width is a metadata field on an 8-bit container, not the
+storage. There is no 2-bit datatype in QNN. The real 2x comes from the
+undocumented `--pack_4_bit_weights`, which switches to the genuine packed
+`UFIXED_POINT_4` type. **4 bits per weight is the floor on this hardware**, and
+w2 buys accuracy loss for zero bytes.
 
 Sizes at each width, DiT plus Qwen3-4B body:
 
-| Component | Params | `w8a16` | `w4a16` | `w2a16` |
-|---|---|---|---|---|
-| S3-DiT | ~6.0 B | ~6.0 GB | ~3.0 GB | ~1.5 GB |
-| Qwen3-4B body (embedding excluded) | ~3.6 B | ~3.6 GB | ~1.8 GB | ~0.9 GB |
-| Flux VAE (enc + dec) | ~0.08 B | ~0.16 GB | — | — |
+| Component | Params | `w8a16` | `w4a16` unpacked | `w4a16` packed | `w2a16` |
+|---|---|---|---|---|---|
+| S3-DiT | ~6.0 B | ~6.0 GB | ~6.0 GB | ~3.0 GB | ~6.0 GB |
+| Qwen3-4B body (embedding excluded) | ~3.6 B | ~3.6 GB | ~3.6 GB | ~1.8 GB | ~3.6 GB |
+| Flux VAE (enc + dec) | ~0.08 B | ~0.16 GB | — | — | — |
+
+The unpacked and `w2a16` columns are not a mistake — see section 10.
 
 Plus `token_emb.bin`: 151936 x 2560 fp16 = **778 MB**, kept out of the graph and
 mmap'd (the token lookup runs on CPU, as it does for Anima). At w4a16 the whole
@@ -829,3 +837,50 @@ image is actually decided.
 This is the worst kind of bug in this pipeline: nothing fails. The part exports,
 converts, quantizes and compiles, and only the images are wrong — after all 30
 parts have been built.
+
+## 10. Weight bit width, measured
+
+Section 2 said 2-bit weights are supported because `qairt-quantizer --help`
+lists them. That is true and it is also not the useful question. Measured on a
+real 1-block DiT part (181 M parameters), same float DLC quantized four ways:
+
+| build | tensor datatype | encoding `bitwidth` | DLC bytes | actual bits/weight |
+|---|---|---|---|---|
+| float | fp32 | — | 724,077,604 | 32 |
+| `--weights_bitwidth 8` | `uFxp_8` | 8 | 181,246,372 | 8 |
+| `--weights_bitwidth 4` | `uFxp_8` | 4 | 181,246,412 | **8** |
+| `--weights_bitwidth 2` | `uFxp_8` | 2 | 181,246,412 | **8** |
+| `--weights_bitwidth 4 --pack_4_bit_weights` | `uFxp_4` | 4 | **90,806,732** | **4** |
+
+**w2 and w4 produce byte-identical DLCs.** `--weights_bitwidth` alone sets a
+metadata field on the encoding, not the storage. `QnnTypes.h` says so directly:
+
+> data quantized to a lower precision will still occupy the full extent of bits
+> allotted to the tensor as per its data type in unpacked form
+
+So `--weights_bitwidth 2` throws away three quarters of the quantization levels
+and stores the result in exactly as many bytes. It is a pure accuracy loss.
+
+**`--pack_4_bit_weights` is the actual lever, and it is hidden** — declared with
+`help=argparse.SUPPRESS`, so it does not appear in `--help`. It switches the
+tensor to `QNN_DATATYPE_UFIXED_POINT_4`, which the header defines as "stored in
+tightly packed format into a single byte ... two 4-bit quantized elements ...
+lower nibble stores the first value while the higher nibble stores the second".
+That is a genuine 2x, and it is why the first DiT context binary came out at
+384 MB for one block.
+
+**There is no 2-bit floor to reach.** The datatype enum has
+`SFIXED_POINT_4/8/16/32` and `UFIXED_POINT_4/8/16/32` and nothing narrower, and
+the packing flag is specifically `pack_4_bit`. **4 bits per weight is the floor
+on this hardware.**
+
+Is w2 *rejected* by the hardware? No — quantizing at 2 and running
+`qnn-context-binary-generator` for Hexagon v73 passes op validation and proceeds
+to compile (5 minutes with no error, against the 1-second rejection an
+unsupported op like `IsNan` produces). It is not incompatible. It is pointless.
+
+The HTP backend documents INT4 explicitly
+(`docs/QNN/HTP/htp-network-design-recommendations/htp_guidelines_int4_weights.html`),
+listing where the power and latency benefits apply — Conv2D 1x1, FullyConnected
+and MatMul with `out_channels > 32`, which is essentially every weight in the
+DiT. There is no INT2 equivalent page.

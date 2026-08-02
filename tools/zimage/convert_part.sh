@@ -101,9 +101,26 @@ fi
 rm -rf "$ODIR"
 say "3/5 DLC built, ONNX released"
 
+# --pack_4_bit_weights is not optional, and it is not in --help (argparse
+# SUPPRESS). Without it, 4-bit weights are stored one-per-byte in a uFxp_8
+# container -- the bit width becomes a metadata field on the encoding and the
+# DLC comes out exactly the size of an 8-bit build. Measured on this part:
+#
+#     float                724,077,604 B   fp32
+#     w8a16                181,246,372 B   uFxp_8, bitwidth 8
+#     w4a16                181,246,412 B   uFxp_8, bitwidth 4   <- no saving
+#     w2a16                181,246,412 B   uFxp_8, bitwidth 2   <- no saving
+#     w4a16 --pack_4_...    90,806,732 B   uFxp_4, bitwidth 4   <- 4.0 bits/weight
+#
+# The flag switches the tensor to QNN_DATATYPE_UFIXED_POINT_4, which QnnTypes.h
+# defines as tightly packed two-per-byte. There is no UFIXED_POINT_2, so 4 bits
+# per weight is the floor on this hardware and --weights_bitwidth 2 buys
+# accuracy loss for zero bytes.
+PACK=()
+[ "$WBITS" = 4 ] && PACK=(--pack_4_bit_weights)
 run quantize "$QNN" "$BIN/qairt-quantizer" --input_dlc "$W/unet_part$N.dlc" \
     --output_dlc "$W/unet_part${N}_q.dlc" --input_list "$W/calib$N.txt" \
-    --weights_bitwidth "$WBITS" --act_bitwidth 16 --bias_bitwidth 32 \
+    --weights_bitwidth "$WBITS" --act_bitwidth 16 --bias_bitwidth 32 "${PACK[@]}" \
     > "$W/quant$N.log" 2>&1 || { echo "quantize FAILED:"; tail -20 "$W/quant$N.log"; exit 1; }
 [ -s "$W/unet_part${N}_q.dlc" ] || { echo "no quantized DLC:"; tail -20 "$W/quant$N.log"; exit 1; }
 rm -f "$W/unet_part$N.dlc"; rm -rf "$W/calib$N"
