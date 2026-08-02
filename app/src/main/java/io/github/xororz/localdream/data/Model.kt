@@ -620,6 +620,11 @@ class ModelRepository private constructor(private val context: Context) {
         val fileUri = "P2Enjoy/z-image-turbo-qnn/resolve/main/model/manifest.json"
 
         val isDownloaded = Model.isModelDownloaded(context, id, false)
+        // Every other NPU model computes this; leaving it at the default false
+        // meant Z-Image was the one entry with no upgrade path -- a directory
+        // written by an older build, missing the "v3" marker, would show as
+        // downloaded forever with no way to refresh it short of deleting.
+        val needsUpgrade = Model.needsModelUpgrade(context, id, true)
 
         return Model(
             id = id,
@@ -630,6 +635,7 @@ class ModelRepository private constructor(private val context: Context) {
             generationSize = 1024,
             approximateSize = "5.8GB",
             isDownloaded = isDownloaded,
+            needsUpgrade = needsUpgrade,
             // Unlike the other distilled models here, these are set in code
             // rather than left to a bundled config.json. Turbo is guidance-free:
             // at the global default of cfg 7 / 20 steps it produces garbage AND
