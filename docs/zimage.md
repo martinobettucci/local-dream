@@ -654,3 +654,37 @@ randomly-initialised fp32 through ONNX export. Any validation that touches them
 unconditionally then fails with `'ZImageTransformer2DModel' object has no
 attribute 'all_x_embedder'`; the checks in `StaticZImageDiT.__init__` are gated
 on `first` / `last` for exactly this reason.
+
+**`hidden_states[-2]` is the output of layer N-1, so the last layer is dead.**
+The reference reads `text_encoder(..., output_hidden_states=True).hidden_states[-2]`.
+It is worth knowing exactly which tensor that is, because it decides how much of
+Qwen3-4B has to be converted at all. Measured on a 4-layer random Qwen3 by
+replaying every stage by hand and matching:
+
+| stage | index in `hidden_states` |
+|---|---|
+| embeddings | `-5` |
+| output of layer 1 | `-4` |
+| output of layer 2 | `-3` |
+| **output of layer 3** | **`-2`** |
+| output of layer 4 | *not present* |
+| `norm(output of layer 4)` | `-1` |
+
+The tuple has `num_layers + 1` entries and the last decoder layer's raw output
+never appears — it is only there normed. So `[-2]` is the output of layer
+**N-1**, and for the real 36-layer encoder **layer 36 and the final RMSNorm are
+never evaluated**. The graph needs 35 layers, ~3.5 B parameters rather than
+~3.6 B. Do not export `Qwen3Model` and slice afterwards; truncate `model.layers`
+to 35 and return the last one's output directly.
+
+Note this is transformers 5.x behaviour, where hidden states are collected by
+output-recorder hooks rather than appended in the forward loop. Re-run the check
+after a transformers bump rather than trusting the table.
+
+**The text encoder needs splitting too, for the same reason the DiT does.**
+35 layers x ~101 M parameters is ~3.5 B, i.e. 14 GB of fp32 — it cannot even be
+held for export on a 15 GB box, let alone quantized. Unlike the DiT this costs
+almost nothing on device: the text encoder runs once per generation and its
+result is prompt-cached, so the extra context switches are amortised over the
+whole image rather than paid on every step. It does mean `clip.bin` has to
+become a chain in the same way `unet_partN.bin` is.
