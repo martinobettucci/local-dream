@@ -26,6 +26,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.Request
 
+/** One file in a model manifest: a plain name and the size it must end up. */
+private data class ManifestEntry(val name: String, val size: Long)
+
 class ModelDownloadService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.IO + Job())
     private var downloadJob: Job? = null
@@ -56,6 +59,9 @@ class ModelDownloadService : Service() {
         const val EXTRA_IS_ZIP = "is_zip"
         const val EXTRA_IS_NPU = "is_npu"
         const val EXTRA_MODEL_TYPE = "model_type" // "sd" or "upscaler"
+
+        // A file URL ending in this is a list of files to fetch, not a model.
+        const val MANIFEST_SUFFIX = "manifest.json"
     }
 
     sealed class DownloadState {
@@ -119,6 +125,26 @@ class ModelDownloadService : Service() {
                     tempDir.deleteRecursively()
                 }
                 tempDir.mkdirs()
+
+                // A manifest means the model is published as loose files rather
+                // than one archive. That is the only workable shape once a model
+                // is several GB: a single zip has to be downloaded AND extracted,
+                // so the device needs twice the model's size free, and a dropped
+                // connection costs the whole archive instead of one file.
+                if (modelType == "sd" && fileUrl.endsWith(MANIFEST_SUFFIX)) {
+                    downloadFromManifest(modelId, modelName, fileUrl, isNpu)
+                    tempDir.deleteRecursively()
+
+                    _downloadState.value = DownloadState.Success(modelId)
+                    updateNotification(modelName, 100f, true)
+                    withContext(Dispatchers.Main) {
+                        kotlinx.coroutines.delay(2000)
+                        _downloadState.value = DownloadState.Idle
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                    }
+                    return@launch
+                }
 
                 tempFile = File(tempDir, "${modelId}_${System.currentTimeMillis()}.tmp")
 
@@ -211,7 +237,21 @@ class ModelDownloadService : Service() {
         }
     }
 
-    private suspend fun downloadFile(url: String, destFile: File, modelId: String, modelName: String) = withContext(Dispatchers.IO) {
+    /**
+     * Downloads one file, reporting progress against a possibly larger whole.
+     *
+     * [doneBefore] and [grandTotal] let a multi-file download report a single
+     * progress bar across every file instead of restarting at 0% for each one.
+     * For a single-file download they are 0 and the file's own length.
+     */
+    private suspend fun downloadFile(
+        url: String,
+        destFile: File,
+        modelId: String,
+        modelName: String,
+        doneBefore: Long = 0L,
+        grandTotal: Long = 0L,
+    ) = withContext(Dispatchers.IO) {
         val request = Request.Builder()
             .url(url)
             .build()
@@ -238,8 +278,11 @@ class ModelDownloadService : Service() {
                         val currentTime = System.currentTimeMillis()
                         if (currentTime - lastUpdateTime >= 500 || downloadedBytes == totalBytes) {
                             lastUpdateTime = currentTime
-                            val progress = if (totalBytes > 0) {
-                                downloadedBytes.toFloat() / totalBytes
+                            val shownDone = doneBefore + downloadedBytes
+                            val shownTotal =
+                                if (grandTotal > 0) grandTotal else totalBytes
+                            val progress = if (shownTotal > 0) {
+                                shownDone.toFloat() / shownTotal
                             } else {
                                 0f
                             }
@@ -247,8 +290,8 @@ class ModelDownloadService : Service() {
                             _downloadState.value = DownloadState.Downloading(
                                 modelId,
                                 progress,
-                                downloadedBytes,
-                                totalBytes,
+                                shownDone,
+                                shownTotal,
                             )
 
                             updateNotification(modelName, progress)
@@ -265,6 +308,94 @@ class ModelDownloadService : Service() {
                 )
             }
         }
+    }
+
+    /**
+     * Downloads a model published as loose files listed in a manifest.
+     *
+     *   { "files": [ { "name": "unet_part1.bin", "size": 384131072 }, ... ] }
+     *
+     * Names are resolved against the manifest's own directory, so the manifest
+     * and the files it lists live side by side and the whole model can be moved
+     * or mirrored by copying one directory.
+     *
+     * Each file is written to `<name>.part` and renamed only once its length
+     * matches the manifest. That makes the download resumable at file
+     * granularity: a run that dies partway leaves the finished files in place,
+     * and a retry re-fetches only what is missing or the wrong size. It also
+     * means a truncated file can never be mistaken for a complete one, which
+     * matters because the backend mmaps these and would read off the end.
+     */
+    private suspend fun downloadFromManifest(
+        modelId: String,
+        modelName: String,
+        manifestUrl: String,
+        isNpu: Boolean,
+    ) = withContext(Dispatchers.IO) {
+        val baseUrl = manifestUrl.substringBeforeLast('/', "")
+        if (baseUrl.isEmpty()) throw Exception("Bad manifest URL: $manifestUrl")
+
+        val manifestJson = client.newCall(Request.Builder().url(manifestUrl).build())
+            .execute().use { response ->
+                if (!response.isSuccessful) {
+                    throw Exception(
+                        getString(R.string.error_download_failed, response.code.toString()),
+                    )
+                }
+                response.body?.string() ?: throw Exception("Empty manifest")
+            }
+
+        val entries = org.json.JSONObject(manifestJson).getJSONArray("files")
+        if (entries.length() == 0) throw Exception("Manifest lists no files")
+
+        val files = (0 until entries.length()).map { i ->
+            val o = entries.getJSONObject(i)
+            val name = o.getString("name")
+            // Names come off the network; keep them to plain filenames so a
+            // crafted manifest cannot write outside the model directory.
+            if (name.contains('/') || name.contains('\\') || name == "." || name == "..") {
+                throw Exception("Manifest entry is not a plain file name: $name")
+            }
+            ManifestEntry(name, o.optLong("size", -1L))
+        }
+
+        val modelDir = File(getModelsDir(), modelId).apply { mkdirs() }
+        val grandTotal = files.sumOf { if (it.size > 0) it.size else 0L }
+
+        // Anything already the right size is left alone, so a retry resumes.
+        var done = files.filter { e ->
+            e.size > 0 && File(modelDir, e.name).length() == e.size
+        }.sumOf { it.size }
+
+        for (entry in files) {
+            val target = File(modelDir, entry.name)
+            if (entry.size > 0 && target.length() == entry.size) {
+                Log.i(TAG, "manifest: ${entry.name} already complete, skipping")
+                continue
+            }
+            target.delete()
+
+            val part = File(modelDir, entry.name + ".part")
+            part.delete()
+            downloadFile("$baseUrl/${entry.name}", part, modelId, modelName, done, grandTotal)
+
+            if (entry.size > 0 && part.length() != entry.size) {
+                part.delete()
+                throw Exception(
+                    getString(
+                        R.string.error_download_failed,
+                        "${entry.name} ${part.length()}/${entry.size}",
+                    ),
+                )
+            }
+            if (!part.renameTo(target)) {
+                part.delete()
+                throw Exception("Could not finalize ${entry.name}")
+            }
+            done += if (entry.size > 0) entry.size else part.length()
+        }
+
+        if (isNpu) File(modelDir, "v3").createNewFile()
     }
 
     private suspend fun unzipFile(zipFile: File, destDir: File) = withContext(Dispatchers.IO) {

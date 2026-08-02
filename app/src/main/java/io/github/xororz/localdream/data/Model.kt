@@ -602,15 +602,16 @@ class ModelRepository private constructor(private val context: Context) {
         return info.totalMem / (1024L * 1024L * 1024L)
     }
 
-    // Z-Image-Turbo, w4a16, split across several HTP contexts.
+    // Z-Image-Turbo, w4a16, split across many HTP contexts.
     //
-    // NOTE: the weights this points at are not published yet — see
-    // docs/zimage.md. Until the P2Enjoy repo below actually holds the zip, the
-    // download will fail; the entry exists so that publishing the artifact is
-    // the only remaining step.
+    // Downloaded as loose files listed in a manifest, not as one archive. At
+    // this size an archive is the wrong shape twice over: the device would need
+    // the zip AND its extraction free at once, and a dropped connection would
+    // cost the whole download instead of one file. The manifest form resumes at
+    // file granularity and writes straight into the model directory.
     private fun createZImageTurboModel(): Model {
         val id = "zimage_turbo"
-        val fileUri = "P2Enjoy/z-image-turbo-qnn/resolve/main/z_image_turbo_w4a16_qnn2.39_8gen3.zip"
+        val fileUri = "P2Enjoy/z-image-turbo-qnn/resolve/main/model/manifest.json"
 
         val isDownloaded = Model.isModelDownloaded(context, id, false)
 
