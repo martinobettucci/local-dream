@@ -168,14 +168,14 @@ backwards is silent.
 | in | `attn_mask` | `[1, T]` — 1 up to `cap_len`, 0 beyond |
 | in | `cap_pad_mask` | `[1, S]` — 1 where a caption row becomes the pad token |
 | out | `hidden` | `[1, T, 3840]` — the fused image+caption token stream |
-| out | `emb` | `[1, 3840]` — the timestep modulation vector |
+| out | `emb` | `[1, 256]` — the timestep adaLN vector (see below) |
 
 **Every later part**
 
 | | name | shape |
 |---|---|---|
 | in | `hidden` | `[1, T, 3840]` |
-| in | `emb` | `[1, 3840]` |
+| in | `emb` | `[1, 256]` |
 | in | `pos_ids` | `[1, T, 3]` int32 |
 | in | `attn_mask` | `[1, T]` |
 | out | `hidden` | `[1, T, 3840]` (non-terminal parts) |
@@ -211,6 +211,13 @@ Qwen tokens, with no quality penalty for short prompts.
 
 Later parts take no `timestep`: `emb` already is the timestep's adaLN vector,
 computed once by part 1 and reused by every block.
+
+`emb` is **256 wide, not `dim`**. `TimestepEmbedder` runs 256 -> 1024 -> 256
+while the residual stream is 3840, and every block's `adaLN_modulation` consumes
+the 256. It is easy to assume the two match — a small test config where
+`dim <= 256` makes them coincide. The runner reads the handoff width from the
+graph rather than assuming, so an export that gets this wrong fails loudly at
+the size check rather than corrupting memory.
 
 Rules the runner enforces:
 

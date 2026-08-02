@@ -28,7 +28,7 @@ from static_export import StaticZImageDiT, build_positions  # noqa: E402
 
 CAP_SLOTS = 512
 LAT = 16          # latent edge -> 8x8 = 64 image tokens (a multiple of 32)
-DIM = 64
+DIM = 384        # > 256 so dim != emb_dim, as in the real model
 N_LAYERS = 6
 T_SCALE = 1000.0
 
@@ -37,10 +37,11 @@ def build():
     torch.manual_seed(0)
     return ZImageTransformer2DModel(
         all_patch_size=[2], all_f_patch_size=[1], in_channels=16,
-        dim=DIM, n_layers=N_LAYERS, n_refiner_layers=1, n_heads=2, n_kv_heads=2,
+        dim=DIM, n_layers=N_LAYERS, n_refiner_layers=1, n_heads=3, n_kv_heads=3,
         norm_eps=1e-5, qk_norm=True, cap_feat_dim=32,
         rope_theta=256.0, t_scale=T_SCALE,
-        axes_dims=[8, 12, 12], axes_lens=[1536, 512, 512],
+        # head_dim = 384/3 = 128 = 32+48+48, the real model's RoPE split
+        axes_dims=[32, 48, 48], axes_lens=[1536, 512, 512],
     ).eval()
 
 
@@ -80,8 +81,11 @@ if __name__ == "__main__":
     sample = torch.randn(1, 16, LAT, LAT)
     sigma = 0.7
 
-    print(f"tiny model: dim={DIM} layers={N_LAYERS} cap_slots={CAP_SLOTS} "
-          f"latent={LAT}x{LAT} ({(LAT // 2) ** 2} image tokens)\n")
+    whole_probe = StaticZImageDiT(model, CAP_SLOTS, LAT, LAT)
+    assert whole_probe.emb_dim != DIM, "test config must keep dim and emb_dim distinct"
+    print(f"tiny model: dim={DIM} emb_dim={whole_probe.emb_dim} layers={N_LAYERS} "
+          f"cap_slots={CAP_SLOTS} latent={LAT}x{LAT} "
+          f"({(LAT // 2) ** 2} image tokens)\n")
 
     print("1. single-piece wrapper vs reference")
     whole = StaticZImageDiT(model, CAP_SLOTS, LAT, LAT)

@@ -170,6 +170,17 @@ class StaticZImageDiT(nn.Module):
                 if self.first else ["hidden", "emb", "pos_ids", "attn_mask"])
 
     @property
+    def emb_dim(self):
+        """Width of the adaLN vector handed between parts.
+
+        This is TimestepEmbedder's OUTPUT width, which is not `dim`: the real
+        model runs 256 -> 1024 -> 256 while dim is 3840. Small test configs can
+        make the two coincide, which hides the difference until real weights
+        turn up.
+        """
+        return self.m.t_embedder.mlp[-1].out_features
+
+    @property
     def output_names(self):
         if self.last:
             return ["out_sample"]
@@ -190,4 +201,4 @@ class StaticZImageDiT(nn.Module):
                     torch.randn(1, self.cap_slots, self.m.config.cap_feat_dim),
                     pos, attn, cap_pad)
         total = self.n_img + self.cap_slots
-        return (torch.randn(1, total, dim), torch.randn(1, dim), pos, attn)
+        return (torch.randn(1, total, dim), torch.randn(1, self.emb_dim), pos, attn)
