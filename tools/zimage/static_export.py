@@ -70,7 +70,8 @@ class StaticZImageDiT(nn.Module):
     """
 
     def __init__(self, model, cap_slots, latent_h, latent_w,
-                 block_start=0, block_end=None, patch=2, f_patch=1):
+                 block_start=0, block_end=None, patch=2, f_patch=1,
+                 first=None, last=None):
         super().__init__()
         self.m = model
         self.key = f"{patch}-{f_patch}"
@@ -94,8 +95,13 @@ class StaticZImageDiT(nn.Module):
         self.block_end = n_layers if block_end is None else int(block_end)
         if not 0 <= self.block_start < self.block_end <= n_layers:
             raise ValueError(f"bad block range [{block_start}, {block_end}) of {n_layers}")
-        self.first = self.block_start == 0
-        self.last = self.block_end == n_layers
+        # Derived from the block range for a whole model, but overridable: the
+        # 6B model never fits in RAM at once, so each part is built as a REDUCED
+        # ZImageTransformer2DModel holding only its own blocks (renumbered from
+        # 0). Such a piece looks like [0, n) — i.e. both first and last — when it
+        # is really neither, so the caller states which it is.
+        self.first = (self.block_start == 0) if first is None else bool(first)
+        self.last = (self.block_end == n_layers) if last is None else bool(last)
 
     # -- pieces ------------------------------------------------------------
     def _patchify(self, sample):
