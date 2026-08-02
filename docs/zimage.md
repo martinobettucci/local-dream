@@ -861,18 +861,41 @@ metadata field on the encoding, not the storage. `QnnTypes.h` says so directly:
 So `--weights_bitwidth 2` throws away three quarters of the quantization levels
 and stores the result in exactly as many bytes. It is a pure accuracy loss.
 
-**`--pack_4_bit_weights` is the actual lever, and it is hidden** — declared with
-`help=argparse.SUPPRESS`, so it does not appear in `--help`. It switches the
-tensor to `QNN_DATATYPE_UFIXED_POINT_4`, which the header defines as "stored in
-tightly packed format into a single byte ... two 4-bit quantized elements ...
-lower nibble stores the first value while the higher nibble stores the second".
-That is a genuine 2x, and it is why the first DiT context binary came out at
-384 MB for one block.
+**`--pack_4_bit_weights` halves the DLC and then the HTP refuses to run it.**
+The flag is hidden (`help=argparse.SUPPRESS`) and it does what it says: the
+weight tensor becomes `QNN_DATATYPE_UFIXED_POINT_4`, tightly packed two per
+byte, 90,806,732 bytes. `qnn-context-binary-generator` for v73 then rejects the
+graph:
 
-**There is no 2-bit floor to reach.** The datatype enum has
-`SFIXED_POINT_4/8/16/32` and `UFIXED_POINT_4/8/16/32` and nothing narrower, and
-the packing flag is specifically `pack_4_bit`. **4 bits per weight is the floor
-on this hardware.**
+```
+Unsupported input/output datatypes requested for the HTP Op 'FullyConnected'
+  in[0]:QNN_DATATYPE_UFIXED_POINT_16
+  in[1]:QNN_DATATYPE_UFIXED_POINT_4      <- the packed weights
+  in[2]:QNN_DATATYPE_SFIXED_POINT_32 (optional)
+  out[0]:QNN_DATATYPE_UFIXED_POINT_16
+```
+
+and helpfully lists every combination it *does* accept. Collected across all
+three configurations:
+
+| activation config | weight datatypes accepted for `FullyConnected` |
+|---|---|
+| FP16 | `FLOAT_16`, `FLOAT_32`, `SFIXED_POINT_8` |
+| INT16 | `SFIXED_POINT_8`, `SFIXED_POINT_16`, `UFIXED_POINT_8`, `UFIXED_POINT_16` |
+| INT8 | `SFIXED_POINT_8`, `UFIXED_POINT_8` |
+
+**No 4-bit weight datatype appears in any configuration.** The narrowest weight
+tensor Hexagon v73 will accept is 8 bits, whatever the encoding says.
+
+So the runnable form of "4-bit" is exactly what `--weights_bitwidth 4` alone
+produces: 4-bit *values* in an 8-bit container. That is also what the HTP's own
+int4 guidelines page means — it promises power and latency benefits "solely from
+the lower transfer of data to/fro VTCM", i.e. from the narrower value range, not
+from a smaller tensor type on disk.
+
+**Every runnable weight width is the same size.** w8a16, w4a16 and w2a16 all
+produce ~181 MB for this part. There is no size lever here at all; the only ones
+are the activation width and the model itself.
 
 Is w2 *rejected* by the hardware? No — quantizing at 2 and running
 `qnn-context-binary-generator` for Hexagon v73 passes op validation and proceeds

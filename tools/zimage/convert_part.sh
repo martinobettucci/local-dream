@@ -101,26 +101,39 @@ fi
 rm -rf "$ODIR"
 say "3/5 DLC built, ONNX released"
 
-# --pack_4_bit_weights is not optional, and it is not in --help (argparse
-# SUPPRESS). Without it, 4-bit weights are stored one-per-byte in a uFxp_8
-# container -- the bit width becomes a metadata field on the encoding and the
-# DLC comes out exactly the size of an 8-bit build. Measured on this part:
+# DO NOT add --pack_4_bit_weights. It is tempting -- it halves the DLC, from
+# 181,246,412 to 90,806,732 bytes on this part, by switching the weight tensor
+# from uFxp_8 to the genuinely packed QNN_DATATYPE_UFIXED_POINT_4 -- and the HTP
+# then refuses to run it:
 #
+#   Unsupported input/output datatypes requested for the HTP Op 'FullyConnected'
+#     in[0]:QNN_DATATYPE_UFIXED_POINT_16
+#     in[1]:QNN_DATATYPE_UFIXED_POINT_4      <- the packed weights
+#     out[0]:QNN_DATATYPE_UFIXED_POINT_16
+#
+# The backend then lists every combination it does accept, and across all three
+# configurations (FP16 / INT16 / INT8) the weight datatypes are only ever
+# FLOAT_16, FLOAT_32, SFIXED_POINT_8/16 and UFIXED_POINT_8/16. There is no
+# 4-bit weight datatype on Hexagon v73 at all.
+#
+# So the working form is 4-bit values in an 8-bit container, which is what
+# --weights_bitwidth 4 alone produces. That is also what the HTP's own int4
+# guidelines mean by "int4 encodings": the benefit is lower VTCM traffic, not a
+# smaller tensor type.
+#
+# Measured on this part, one float DLC quantized four ways:
 #     float                724,077,604 B   fp32
-#     w8a16                181,246,372 B   uFxp_8, bitwidth 8
-#     w4a16                181,246,412 B   uFxp_8, bitwidth 4   <- no saving
-#     w2a16                181,246,412 B   uFxp_8, bitwidth 2   <- no saving
-#     w4a16 --pack_4_...    90,806,732 B   uFxp_4, bitwidth 4   <- 4.0 bits/weight
+#     w8a16                181,246,372 B   uFxp_8, bitwidth 8   runs
+#     w4a16                181,246,412 B   uFxp_8, bitwidth 4   runs
+#     w2a16                181,246,412 B   uFxp_8, bitwidth 2   runs, pointless
+#     w4a16 --pack_4_...    90,806,732 B   uFxp_4, bitwidth 4   REJECTED by HTP
 #
-# The flag switches the tensor to QNN_DATATYPE_UFIXED_POINT_4, which QnnTypes.h
-# defines as tightly packed two-per-byte. There is no UFIXED_POINT_2, so 4 bits
-# per weight is the floor on this hardware and --weights_bitwidth 2 buys
-# accuracy loss for zero bytes.
-PACK=()
-[ "$WBITS" = 4 ] && PACK=(--pack_4_bit_weights)
+# All three runnable widths are the same size on disk. w4 is kept over w8 for
+# the documented VTCM latency benefit, not for bytes; switch to 8 if quality
+# turns out to be the binding problem, at no size cost.
 run quantize "$QNN" "$BIN/qairt-quantizer" --input_dlc "$W/unet_part$N.dlc" \
     --output_dlc "$W/unet_part${N}_q.dlc" --input_list "$W/calib$N.txt" \
-    --weights_bitwidth "$WBITS" --act_bitwidth 16 --bias_bitwidth 32 "${PACK[@]}" \
+    --weights_bitwidth "$WBITS" --act_bitwidth 16 --bias_bitwidth 32 \
     > "$W/quant$N.log" 2>&1 || { echo "quantize FAILED:"; tail -20 "$W/quant$N.log"; exit 1; }
 [ -s "$W/unet_part${N}_q.dlc" ] || { echo "no quantized DLC:"; tail -20 "$W/quant$N.log"; exit 1; }
 rm -f "$W/unet_part$N.dlc"; rm -rf "$W/calib$N"
