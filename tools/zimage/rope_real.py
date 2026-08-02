@@ -64,11 +64,36 @@ def _processor_call(self, attn, hidden_states, encoder_hidden_states=None,
     if attention_mask is not None and attention_mask.ndim == 2:
         attention_mask = attention_mask[:, None, None, :]
 
-    # Plain SDPA instead of the dispatcher: one backend, statically traceable.
     q = query.transpose(1, 2)
     k = key.transpose(1, 2)
     v = value.transpose(1, 2)
-    hs = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask)
+
+    # Attention written out rather than F.scaled_dot_product_attention.
+    #
+    # SDPA with a *boolean* mask does not export to something the HTP can run:
+    # torch's ONNX decomposition adds an IsNaN/Where guard for rows where every
+    # key is masked (softmax of all -inf is NaN), and qnn-context-binary-generator
+    # rejects it outright --
+    #     validateNativeOps master op validator .../IsNaN:qti.aisw:IsNan failed 3110
+    #     Input[0] has incorrect Datatype 0x416
+    # after the DLC has already converted and quantized cleanly. Writing the
+    # four steps out keeps the graph to MatMul / Add / Softmax.
+    #
+    # No NaN guard is needed here because no row is ever fully masked: this
+    # runner's mask always keeps at least the image tokens, which come first.
+    # An additive float mask, not a boolean one, for the same reason -- 0 where
+    # attending is allowed, a large negative where it is not, and -1e4 rather
+    # than -inf so 16-bit activation quantization has a finite range to encode.
+    scale = q.shape[-1] ** -0.5
+    scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+    if attention_mask is not None:
+        if attention_mask.dtype == torch.bool:
+            attention_mask = torch.where(
+                attention_mask,
+                torch.zeros((), dtype=scores.dtype),
+                torch.full((), -1e4, dtype=scores.dtype))
+        scores = scores + attention_mask.to(scores.dtype)
+    hs = torch.matmul(torch.softmax(scores, dim=-1), v)
     hs = hs.transpose(1, 2).flatten(2).type_as(query)
     return attn.to_out[0](hs)
 

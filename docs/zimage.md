@@ -734,3 +734,33 @@ Measured, one part at a time, w4a16, on 16 GB RAM + 6 GB swap:
 Note the export and convert stages are nowhere near the limit — export peaks at
 5.3 GB for a 2-block part and the converter at 3.4 GB. **Only quantization is
 memory-bound**, so there is no point splitting finer than quantization requires.
+
+**The HTP has no `IsNan`, and `F.scaled_dot_product_attention` emits one.**
+This is the first failure that appears only at the *last* stage. The DLC
+converts cleanly, quantizes cleanly, and then
+`qnn-context-binary-generator` refuses it:
+
+```
+[ ERROR ] Input[0] has incorrect Datatype 0x416.
+[ ERROR ] validateNativeOps master op validator
+          /layers.0/attention/IsNaN:qti.aisw:IsNan failed 3110
+[ ERROR ] Failed to validate op /layers.0/attention/IsNaN with error 0xc26
+```
+
+SDPA with a **boolean** `attn_mask` decomposes, on export, into a form that
+guards rows where every key is masked — softmax of an all-`-inf` row is NaN — so
+torch inserts `IsNaN` plus a `Where`. The HTP has neither, and the bool input
+trips a datatype check on top.
+
+`rope_real.py` therefore writes attention out as MatMul / Add / Softmax /
+MatMul, with an **additive** mask: `0` where attending is allowed and `-1e4`
+where it is not. Two reasons for `-1e4` rather than `-inf`: activations are
+quantized to 16 bits and need a finite range, and no NaN guard is required at
+all here because no row is ever fully masked — the runner's sequence puts the
+image tokens first and always keeps them. Measured against SDPA on random
+inputs: `3.6e-07` max abs difference with a mask, against `3.0e-07` for the
+unmasked control, i.e. summation-order noise rather than a behaviour change.
+
+Worth internalising: **a graph that quantizes is not a graph that compiles.**
+Op-support failures surface only at context-binary generation, which is also the
+slowest stage. Build one part end to end before starting the other 29.
