@@ -167,9 +167,29 @@ def build_part(sd, n_blocks, first, last):
                 delattr(model, attr)
         gc.collect()
 
-    sd = {k: v.to(torch.float32) for k, v in sd.items()}
-    missing, unexpected = model.load_state_dict(sd, strict=False)
-    del sd
+    # Copy tensor by tensor, in place, popping each source as it lands.
+    #
+    # The obvious `model.load_state_dict({k: v.float() for ...})` holds three
+    # full copies of the part at once -- the fp16 dict that was fetched, the
+    # fp32 dict built from it, and the model's own parameters. For a middle part
+    # that is 0.7 + 1.4 + 1.4 GB and nobody notices. Part 1 also carries both
+    # refiner stacks and the embedders, 3.63 GB of fp32, so the same code peaks
+    # around 9 GB of weights on top of ~7 GB of ONNX tracing and gets OOM-killed
+    # at 15.3 GB. Popping keeps it to the model plus what is left of the fp16.
+    msd = model.state_dict()
+    unexpected, seen = [], set()
+    with torch.no_grad():
+        for k in list(sd.keys()):
+            t = sd.pop(k)
+            dst = msd.get(k)
+            if dst is None:
+                unexpected.append(k)
+            else:
+                dst.copy_(t.to(torch.float32))
+                seen.add(k)
+            del t
+    missing = [k for k in msd if k not in seen]
+    del sd, msd
     gc.collect()
     if unexpected:
         raise RuntimeError(f"unexpected tensors for part: {unexpected[:5]}")

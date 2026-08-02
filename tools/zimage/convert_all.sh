@@ -44,7 +44,15 @@ echo "==> $NPARTS parts, w${WBITS}a16, Hexagon $ARCH -> $HF_REPO/$REMOTE_DIR"
 DONE="$("$PY" "$HERE/upload_hf.py" --repo "$HF_REPO" --list-remote "$REMOTE_DIR/" 2>/dev/null || true)"
 echo "==> already on the Hub: $(echo "$DONE" | grep -c 'unet_part' || true) parts"
 
-for N in $(seq 1 "$NPARTS"); do
+# Part order, not part range. Part 1 is not like the others: it carries both
+# refiner stacks and every embedder on top of its own block, which is 3.63 GB of
+# fp32 against ~0.72 GB for a middle part -- five times the weights, five times
+# the ONNX, and an export that peaks near the RAM ceiling. Doing it last means
+# it runs when every other part has been uploaded and deleted, so it gets the
+# whole disk and the whole machine instead of competing with 29 siblings.
+ORDER="${ORDER:-$(seq 2 "$NPARTS"; echo 1)}"
+
+for N in $ORDER; do
   if echo "$DONE" | grep -qx "$REMOTE_DIR/unet_part$N.bin"; then
     echo "==> part$N already published, skipping"
     continue
