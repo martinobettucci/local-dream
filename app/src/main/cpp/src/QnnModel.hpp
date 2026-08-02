@@ -1154,16 +1154,64 @@ class QnnModel : public QnnSampleApp {
       return StatusCode::FAILURE;
 
     if (!runGraph(graphInfo, "zimage text encoder")) return StatusCode::FAILURE;
+    return readZImageClipOutput(graphInfo, out_context, S * D)
+               ? StatusCode::SUCCESS
+               : StatusCode::FAILURE;
+  }
 
+  // Text encoder parts after the first. Qwen3-4B is split across contexts
+  // because 3.5 B parameters cannot be quantized in one piece; the chain runs
+  // once per prompt, so unlike the DiT the extra hand-offs are amortised over a
+  // whole image rather than paid per step.
+  //
+  //   part 1    : (input_embedding, attention_mask) -> hidden
+  //   part 1<k<N: (hidden_in, attention_mask)       -> hidden
+  //   part N    : (hidden_in, attention_mask)       -> context
+  //
+  // The mask reaches every part because each one rebuilds the causal + padding
+  // mask internally from it. "hidden_in" rather than "hidden" for the input,
+  // for the same reason the DiT parts use it: ONNX cannot name an input and an
+  // output the same thing.
+  StatusCode executeZImageClipNext(const float *hidden_in,
+                                   const float *attention_mask,
+                                   float *out_hidden) {
+    if (!ensureIoTensors()) return StatusCode::FAILURE;
+    auto graphInfo = (*m_graphsInfo)[0];
+    logGraphIoOnce("zimage", "text_encoder_partN", graphInfo);
+
+    const size_t S = zimage_text_seq_len;
+    const size_t D = zimage_text_embedding_size;
+    if (!writeNamedFloat(graphInfo, "hidden_in", hidden_in, S * D) ||
+        !writeNamedFloat(graphInfo, "attention_mask", attention_mask, S))
+      return StatusCode::FAILURE;
+
+    if (!runGraph(graphInfo, "zimage text encoder part"))
+      return StatusCode::FAILURE;
+    return readZImageClipOutput(graphInfo, out_hidden, S * D)
+               ? StatusCode::SUCCESS
+               : StatusCode::FAILURE;
+  }
+
+  // The terminal part of the encoder chain emits "context"; every earlier part
+  // emits "hidden". A single-part encoder is terminal, so it emits "context"
+  // too and the same read serves both layouts.
+  bool readZImageClipOutput(const qnn_wrapper_api::GraphInfo_t &graphInfo,
+                            float *dst, size_t elems) {
     Qnn_Tensor_t *to =
         findTensor(outputs, graphInfo.numOutputTensors, "context");
+    if (!to) to = findTensor(outputs, graphInfo.numOutputTensors, "hidden");
     if (!to) {
-      QNN_ERROR("zimage text encoder: missing output 'context'");
-      return StatusCode::FAILURE;
+      QNN_ERROR("zimage text encoder: part emits neither 'context' nor "
+                "'hidden'");
+      return false;
     }
-    memcpy(out_context, QNN_TENSOR_GET_CLIENT_BUF(*to).data,
-           S * D * sizeof(float));
-    return StatusCode::SUCCESS;
+    if (tensorElems(*to) != elems) {
+      QNN_ERROR("zimage text encoder: output has %zu elements, expected %zu",
+                tensorElems(*to), elems);
+      return false;
+    }
+    memcpy(dst, QNN_TENSOR_GET_CLIENT_BUF(*to).data, elems * sizeof(float));
+    return true;
   }
 
   StatusCode executeUpscalerGraphs(float *input_image, float *output_image) {

@@ -84,7 +84,9 @@ Everything goes in one model directory under the app's `models/`:
   ZIMAGE              # empty marker file; makes the app list it as a Z-Image model
   tokenizer.json      # Qwen2Tokenizer (from Z-Image-Turbo/tokenizer/)
   token_emb.bin       # fp16 [vocab, 2560] token embedding table, row-major
-  clip.bin            # QNN context binary: Qwen3-4B text encoder
+  clip_part1.bin      # QNN context binaries: Qwen3-4B text encoder, cut into
+  clip_part2.bin      #   M pieces, numbered from 1, M discovered on disk.
+  ...                 #   A single clip.bin is still accepted (the M = 1 case).
   unet_part1.bin      # QNN context binaries: the S3-DiT, cut into N pieces
   unet_part2.bin      #   numbered from 1, contiguous, N discovered on disk
   ...
@@ -129,13 +131,32 @@ Constants referenced here live in `Config.hpp`: `S = 512` (context length),
 `D = 2560` (Qwen3-4B hidden / DiT `cap_feat_dim`), `C = 16` (latent channels),
 `H = W = 128` (latent grid at 1024×1024).
 
-### `clip.bin` — Qwen3-4B text encoder
+### `clip_part1.bin` … `clip_partM.bin` — Qwen3-4B text encoder
+
+Split for the same reason the DiT is — 3.5 B parameters cannot be quantized in
+one piece — but far cheaper: the chain runs **once per prompt** and the result
+is prompt-cached, so the extra hand-offs are amortised over a whole image rather
+than paid on every step.
+
+**Part 1**
 
 | | name | shape |
 |---|---|---|
 | in | `input_embedding` | `[1, S, D]` |
 | in | `attention_mask` | `[1, S]` (1.0 = real token, 0.0 = pad) |
-| out | `context` | `[1, S, D]` |
+| out | `hidden` | `[1, S, D]` (or `context`, if it is also the last part) |
+
+**Every later part**
+
+| | name | shape |
+|---|---|---|
+| in | `hidden_in` | `[1, S, D]` |
+| in | `attention_mask` | `[1, S]` |
+| out | `hidden` | `[1, S, D]`, or `context` on the terminal part |
+
+`attention_mask` reaches every part because each one rebuilds the causal +
+padding mask from it internally. `hidden_in` rather than `hidden` on the input
+for the same ONNX naming reason as the DiT.
 
 Two things are easy to get wrong here:
 

@@ -58,12 +58,13 @@
 class PipelineZImage : public PipelineQnn {
  public:
   PipelineZImage(TextEncoder &text_encoder, const std::string &model_dir,
-                 std::string clip_path, std::vector<std::string> dit_part_paths,
+                 std::vector<std::string> clip_part_paths,
+                 std::vector<std::string> dit_part_paths,
                  std::string vae_decoder_path, std::string vae_encoder_path,
                  bool lowram, bool seq_dit)
       : PipelineQnn(text_encoder, model_dir, /*sdxl=*/false,
                     /*use_v_pred=*/false),
-        clip_path_(std::move(clip_path)),
+        clip_part_paths_(std::move(clip_part_paths)),
         dit_part_paths_(std::move(dit_part_paths)),
         vae_decoder_path_(std::move(vae_decoder_path)),
         vae_encoder_path_(std::move(vae_encoder_path)),
@@ -73,7 +74,10 @@ class PipelineZImage : public PipelineQnn {
         seq_dit_(lowram && seq_dit) {
     if (dit_part_paths_.empty())
       throw std::runtime_error("zimage: no DiT part binaries given");
+    if (clip_part_paths_.empty())
+      throw std::runtime_error("zimage: no text encoder binaries given");
     dit_parts_.resize(dit_part_paths_.size());
+    clip_parts_.resize(clip_part_paths_.size());
   }
 
   bool initialize() override {
@@ -85,11 +89,18 @@ class PipelineZImage : public PipelineQnn {
       return true;
     }
 
-    clip_ = qnn_runtime::createModel(clip_path_, "clip");
     vae_decoder_ = qnn_runtime::createModel(vae_decoder_path_, "vae_decoder");
-    if (!clip_ || !vae_decoder_) {
-      QNN_ERROR("Failed to create Z-Image text encoder / VAE decoder.");
+    if (!vae_decoder_) {
+      QNN_ERROR("Failed to create Z-Image VAE decoder.");
       return false;
+    }
+    for (size_t i = 0; i < clip_part_paths_.size(); ++i) {
+      clip_parts_[i] =
+          qnn_runtime::createModel(clip_part_paths_[i], clipTag(i).c_str());
+      if (!clip_parts_[i]) {
+        QNN_ERROR("Failed to create Z-Image text encoder part %zu.", i + 1);
+        return false;
+      }
     }
     for (size_t i = 0; i < dit_part_paths_.size(); ++i) {
       dit_parts_[i] =
@@ -124,9 +135,12 @@ class PipelineZImage : public PipelineQnn {
       return false;
     if (sf_bytes) head = vae_decoder_->getContextHandle();
 
-    clip_->setSpillFillGroup(sf_bytes, head);
-    if (qnn_runtime::initializeApp("TextEncoder", clip_) != EXIT_SUCCESS)
-      return false;
+    for (size_t i = 0; i < clip_parts_.size(); ++i) {
+      clip_parts_[i]->setSpillFillGroup(sf_bytes, head);
+      if (qnn_runtime::initializeApp(clipTag(i).c_str(), clip_parts_[i]) !=
+          EXIT_SUCCESS)
+        return false;
+    }
 
     for (size_t i = 0; i < dit_parts_.size(); ++i) {
       dit_parts_[i]->setSpillFillGroup(sf_bytes, head);
@@ -196,7 +210,7 @@ class PipelineZImage : public PipelineQnn {
   void encodeText(const ProcessedPromptPair &prompts, bool need_negative,
                   bool need_positive, Conditioning &cond) override {
     if (lowram_) loadClipIfNeeded();
-    if (!clip_)
+    if (clip_parts_.empty() || !clip_parts_.front())
       throw std::runtime_error("Z-Image text encoder not initialized!");
     if (need_negative)
       runTextEncoder(prompts.negative_embeddings, prompts.negative_qwen_mask,
@@ -392,10 +406,33 @@ class PipelineZImage : public PipelineQnn {
       throw std::runtime_error("Z-Image conditioning has no mask slot");
     if ((int)mask.size() != zimage_text_seq_len)
       throw std::runtime_error("Z-Image attention mask has the wrong length");
-    if (StatusCode::SUCCESS != clip_->executeZImageTextEncoder(
-                                   input_embedding.data(), mask.data(),
-                                   out_hidden))
-      throw std::runtime_error("Z-Image text encoder failed");
+    // Qwen3-4B is split across contexts for the same reason the DiT is: 3.5 B
+    // parameters cannot be quantized in one piece on any machine this converts
+    // on. Unlike the DiT this costs almost nothing at runtime -- the chain runs
+    // once per prompt and the result is prompt-cached, rather than once per
+    // step. Part 1 takes the embeddings, every later part takes the previous
+    // part's hidden state, and the last emits `context`.
+    const size_t elems =
+        (size_t)zimage_text_seq_len * zimage_text_embedding_size;
+    if (clip_state_.size() != elems) clip_state_.assign(elems, 0.0f);
+    for (size_t i = 0; i < clip_parts_.size(); ++i) {
+      auto &part = clip_parts_[i];
+      if (!part)
+        throw std::runtime_error("Z-Image text encoder part " +
+                                 std::to_string(i + 1) + " not loaded");
+      const bool last = (i + 1 == clip_parts_.size());
+      // The last part writes straight into the caller's buffer; the rest hand
+      // off through clip_state_.
+      float *dst = last ? out_hidden : clip_state_.data();
+      const StatusCode st =
+          (i == 0) ? part->executeZImageTextEncoder(input_embedding.data(),
+                                                    mask.data(), dst)
+                   : part->executeZImageClipNext(clip_state_.data(),
+                                                 mask.data(), dst);
+      if (st != StatusCode::SUCCESS)
+        throw std::runtime_error("Z-Image text encoder part " +
+                                 std::to_string(i + 1) + " failed");
+    }
     // The DiT consumes the same mask at every step, and the prompt cache
     // persists it from this slot, so it has to be written whether or not the
     // encoder ran.
@@ -406,17 +443,33 @@ class PipelineZImage : public PipelineQnn {
     return "unet_part" + std::to_string(i + 1);
   }
 
+  std::string clipTag(size_t i) const {
+    return "clip_part" + std::to_string(i + 1);
+  }
+
   // ---- lowram stage (un)loading --------------------------------------------
+  // The whole chain is resident together rather than one part at a time. In
+  // lowram this runs with the DiT and VAE already released, so the encoder has
+  // the device to itself, and it executes once per prompt -- reloading a
+  // context per part would pay the load cost for no memory that is needed
+  // elsewhere at that moment.
   void loadClipIfNeeded() {
-    if (clip_) return;
-    clip_ = qnn_runtime::createAndInitModel(clip_path_, "clip");
-    if (!clip_)
-      throw std::runtime_error("[lowram] Failed to load Z-Image text encoder");
-    QNN_INFO("[lowram] Z-Image text encoder loaded");
+    if (!clip_parts_.empty() && clip_parts_.front()) return;
+    for (size_t i = 0; i < clip_part_paths_.size(); ++i) {
+      clip_parts_[i] = qnn_runtime::createAndInitModel(clip_part_paths_[i],
+                                                       clipTag(i).c_str());
+      if (!clip_parts_[i])
+        throw std::runtime_error("[lowram] Failed to load Z-Image text encoder "
+                                 "part " + std::to_string(i + 1));
+    }
+    QNN_INFO("[lowram] Z-Image text encoder loaded (%zu part(s))",
+             clip_parts_.size());
   }
   void releaseClip() {
-    if (!clip_) return;
-    clip_.reset();
+    if (clip_parts_.empty() || !clip_parts_.front()) return;
+    for (auto &p : clip_parts_) p.reset();
+    clip_state_.clear();
+    clip_state_.shrink_to_fit();
     if (lowram_) QNN_INFO("[lowram] Z-Image text encoder released");
   }
 
@@ -499,14 +552,17 @@ class PipelineZImage : public PipelineQnn {
     return 601096192ULL;
   }
 
-  const std::string clip_path_;
+  const std::vector<std::string> clip_part_paths_;
   const std::vector<std::string> dit_part_paths_;
   const std::string vae_decoder_path_;
   const std::string vae_encoder_path_;
   const bool lowram_;
   const bool seq_dit_;
 
-  std::unique_ptr<QnnModel> clip_;
+  std::vector<std::unique_ptr<QnnModel>> clip_parts_;
+  // Residual stream handed between text encoder parts, [1, S, D]. Held here
+  // rather than on the stack: it is 5 MB and encodeText runs per prompt.
+  std::vector<float> clip_state_;
   std::vector<std::unique_ptr<QnnModel>> dit_parts_;
   // {hidden, emb} handed from one part to the next, reused across steps.
   std::vector<std::vector<float>> dit_state_;

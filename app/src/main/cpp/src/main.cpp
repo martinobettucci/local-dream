@@ -303,32 +303,49 @@ static std::unique_ptr<Pipeline> createPipeline(const ServerOptions &opts,
   const bool sdxl = opts.isSdxl();
   const bool anima = opts.isAnima();
 
-  // Z-Image: Qwen3-4B text encoder (clip.bin, QNN) + an N-way split S3-DiT +
-  // 16-ch Flux VAE. The DiT part count is a property of the conversion, so the
-  // parts are discovered rather than fixed: unet_part1.bin upward, stopping at
-  // the first gap.
+  // Z-Image: Qwen3-4B text encoder + an N-way split S3-DiT + 16-ch Flux VAE.
+  // Both the encoder and the DiT are cut into as many pieces as the converting
+  // machine's memory required, so both counts are properties of the conversion
+  // and are discovered on disk rather than fixed here: partK.bin upward,
+  // stopping at the first gap.
   if (opts.isZImage()) {
-    std::string clip_path = (dir / "clip.bin").string();
     std::string vae_decoder_path = (dir / "vae_decoder.bin").string();
     std::string vae_encoder_path =
         opts.no_img2img ? "" : (dir / "vae_encoder.bin").string();
 
-    std::vector<std::string> dit_parts;
-    for (int i = 1; i <= zimage_max_dit_parts; ++i) {
-      auto p = dir / ("unet_part" + std::to_string(i) + ".bin");
-      if (!std::filesystem::exists(p)) break;
-      dit_parts.push_back(p.string());
-    }
+    auto discover = [&dir](const char *stem) {
+      std::vector<std::string> found;
+      for (int i = 1; i <= zimage_max_dit_parts; ++i) {
+        auto p = dir / (stem + std::to_string(i) + ".bin");
+        if (!std::filesystem::exists(p)) break;
+        found.push_back(p.string());
+      }
+      return found;
+    };
+
+    std::vector<std::string> dit_parts = discover("unet_part");
     if (dit_parts.empty())
       showHelpAndExit("File not found: " +
                       (dir / "unet_part1.bin").string() +
                       " (zimage needs at least one DiT part)");
-    QNN_INFO("zimage: found %zu DiT part(s)", dit_parts.size());
+
+    // A single-file clip.bin is still accepted: it is exactly the one-part case
+    // of the chain, and an encoder small enough to convert whole should not
+    // need renaming to load.
+    std::vector<std::string> clip_parts = discover("clip_part");
+    if (clip_parts.empty()) {
+      auto single = dir / "clip.bin";
+      if (!std::filesystem::exists(single))
+        showHelpAndExit("File not found: " + single.string() + " (or " +
+                        (dir / "clip_part1.bin").string() + ")");
+      clip_parts.push_back(single.string());
+    }
+    QNN_INFO("zimage: found %zu DiT part(s), %zu text encoder part(s)",
+             dit_parts.size(), clip_parts.size());
 
     std::vector<std::string> required = {
         (dir / "tokenizer.json").string(),
         (dir / "token_emb.bin").string(),
-        clip_path,
         vae_decoder_path,
     };
     if (!vae_encoder_path.empty()) required.push_back(vae_encoder_path);
@@ -336,8 +353,9 @@ static std::unique_ptr<Pipeline> createPipeline(const ServerOptions &opts,
       if (!std::filesystem::exists(p)) showHelpAndExit("File not found: " + p);
     }
     return std::make_unique<PipelineZImage>(
-        text_encoder, opts.model_dir, clip_path, std::move(dit_parts),
-        vae_decoder_path, vae_encoder_path, opts.lowram, opts.anima_seq_dit);
+        text_encoder, opts.model_dir, std::move(clip_parts),
+        std::move(dit_parts), vae_decoder_path, vae_encoder_path, opts.lowram,
+        opts.anima_seq_dit);
   }
 
   // Anima: Qwen "CLIP" (clip.bin, QNN) + split DiT (unet_part1/2.bin) + 16-ch
