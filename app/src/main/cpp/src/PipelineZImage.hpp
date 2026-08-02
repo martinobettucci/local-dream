@@ -33,8 +33,10 @@
 // Differences from the Anima DiT that shares this base class:
 //   * single-stream. Text and image tokens occupy ONE residual sequence, so
 //     the caption is folded into `hidden` by part 1 and never re-supplied.
-//     What every part does take is the caption mask, because padded caption
-//     rows must not be attended to and the pad count varies per prompt.
+//     What every part does take is the per-token RoPE coordinates and the
+//     attention mask: the reference drops padded caption rows, so the caption
+//     length — and with it every image token's t coordinate — varies per
+//     prompt and cannot be baked into the graph.
 //   * Flux VAE scaling is a scalar shift/scale pair, not Wan's per-channel
 //     mean/std table.
 //   * the DiT's t_scale is 1000, so the value handed to the graph is
@@ -235,6 +237,65 @@ class PipelineZImage : public PipelineQnn {
                 cond.posPooled(), out_batch2 + single);
   }
 
+  // Number of image tokens: the DiT folds each 2x2 latch of latent into one
+  // token, so a 128x128 latent becomes a 64x64 token grid.
+  int imageTokens() const {
+    return (sample_width / zimage_patch_size) *
+           (sample_height / zimage_patch_size);
+  }
+  int totalTokens() const { return zimage_text_seq_len + imageTokens(); }
+
+  // Builds the 3D RoPE coordinates and attention mask for one prompt side.
+  //
+  // This has to mirror the reference pipeline exactly, and the subtle part is
+  // that it is length-dependent. Z-Image drops padded caption rows before the
+  // DiT sees them, pads what is left up to a multiple of SEQ_MULTI_OF, and then
+  // positions the image tokens at cap_len + 1. So the caption's real length
+  // shifts every image token's t coordinate. A static graph keeps 512 caption
+  // slots regardless, which is why the coordinates are computed here per prompt
+  // and fed in rather than baked into the graph — pinning them as though the
+  // caption were always 512 long measurably changes the output.
+  void buildPositions(const float *mask, std::vector<int32_t> &pos_ids,
+                      std::vector<float> &attn_mask) const {
+    int true_len = 0;
+    for (int i = 0; i < zimage_text_seq_len; ++i)
+      if (mask[i] > 0.5f) ++true_len;
+    // Round up to the sequence multiple, exactly as _pad_with_ids does.
+    int cap_len = ((true_len + zimage_seq_multiple - 1) / zimage_seq_multiple) *
+                  zimage_seq_multiple;
+    if (cap_len > zimage_text_seq_len) cap_len = zimage_text_seq_len;
+
+    const int tokens = totalTokens();
+    pos_ids.assign((size_t)tokens * zimage_rope_axes, 0);
+    attn_mask.assign(tokens, 0.0f);
+
+    // Caption block: t = 1..cap_len over the occupied slots, (0,0,0) beyond.
+    // Only the genuinely real rows are attended to.
+    for (int i = 0; i < zimage_text_seq_len; ++i) {
+      const size_t o = (size_t)i * zimage_rope_axes;
+      if (i < cap_len) pos_ids[o] = i + 1;
+      attn_mask[i] = (i < true_len) ? 1.0f : 0.0f;
+    }
+
+    // Image block: a single t plane at cap_len + 1, indexed by (h, w).
+    const int grid_h = sample_height / zimage_patch_size;
+    const int grid_w = sample_width / zimage_patch_size;
+    const int t_img = cap_len + 1;
+    if (t_img >= zimage_rope_axis_len_t)
+      QNN_WARN("zimage: image t coordinate %d exceeds the RoPE table (%d)",
+               t_img, zimage_rope_axis_len_t);
+    for (int r = 0; r < grid_h; ++r) {
+      for (int c = 0; c < grid_w; ++c) {
+        const int tok = zimage_text_seq_len + r * grid_w + c;
+        const size_t o = (size_t)tok * zimage_rope_axes;
+        pos_ids[o + 0] = t_img;
+        pos_ids[o + 1] = r;
+        pos_ids[o + 2] = c;
+        attn_mask[tok] = 1.0f;
+      }
+    }
+  }
+
   void endDenoise() override {
     if (!lowram_) return;
     releaseDitParts();
@@ -276,6 +337,10 @@ class PipelineZImage : public PipelineQnn {
   // prompt-dependent and so cannot live inside the graph.
   void runDitChain(const float *sample, float timestep, const float *context,
                    const float *mask, float *out) {
+    if (!mask) throw std::runtime_error("Z-Image conditioning has no mask");
+    buildPositions(mask, pos_ids_, attn_mask_);
+    const size_t tokens = (size_t)totalTokens();
+
     const size_t n = dit_part_paths_.size();
     for (size_t i = 0; i < n; ++i) {
       if (seq_dit_) loadDitPartAlone(i);
@@ -294,10 +359,12 @@ class PipelineZImage : public PipelineQnn {
                  i + 1, n);
 
       StatusCode st =
-          (i == 0) ? part->executeZImageDitFirst(sample, timestep, context,
-                                                 mask, dit_state_,
-                                                 terminal ? out : nullptr)
-                   : part->executeZImageDitNext(dit_state_, timestep, mask,
+          (i == 0) ? part->executeZImageDitFirst(
+                         sample, timestep, context, pos_ids_.data(),
+                         attn_mask_.data(), tokens, dit_state_,
+                         terminal ? out : nullptr)
+                   : part->executeZImageDitNext(dit_state_, pos_ids_.data(),
+                                                attn_mask_.data(), tokens,
                                                 terminal ? out : nullptr);
       if (seq_dit_) releaseDitPart(i);
       if (st != StatusCode::SUCCESS)
@@ -435,6 +502,10 @@ class PipelineZImage : public PipelineQnn {
   std::vector<std::unique_ptr<QnnModel>> dit_parts_;
   // {hidden, emb} handed from one part to the next, reused across steps.
   std::vector<std::vector<float>> dit_state_;
+  // Rebuilt per CFG branch (the two sides can have different prompt lengths),
+  // reused across steps and parts.
+  std::vector<int32_t> pos_ids_;
+  std::vector<float> attn_mask_;
 };
 
 #endif  // PIPELINEZIMAGE_HPP

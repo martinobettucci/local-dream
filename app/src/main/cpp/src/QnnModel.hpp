@@ -913,17 +913,27 @@ class QnnModel : public QnnSampleApp {
   // The S3-DiT is single-stream: text and image tokens live in ONE residual
   // sequence, so unlike Anima's split there is no separate `context` to
   // re-supply past the first part — the caption tokens are already inside
-  // `hidden`. What every part does need is the timestep (each recomputes its
-  // own adaLN modulation, avoiding the slow flat-tensor layout Anima hit) and
-  // the caption mask (padded caption rows must not be attended to, and the pad
-  // count is prompt-dependent, so it cannot be baked into the graph).
+  // `hidden`. Two things do have to reach every part:
+  //
+  //   pos_ids   3D RoPE coordinates (t, h, w) per token. These CANNOT be baked
+  //             into the graph. The reference pipeline drops padded caption
+  //             rows before the DiT sees them, so the caption length varies
+  //             per prompt, and image tokens sit at cap_len + 1 — so every
+  //             image token's t coordinate moves with the prompt.
+  //             Fixing them (as if the caption were always 512 long) measurably
+  //             changes the output; see docs/zimage.md section 9.
+  //   attn_mask 1 for a real token, 0 for a padded caption slot.
+  //
+  // `emb` (the timestep adaLN vector) is computed once by part 1 and reused by
+  // every block, so later parts take it directly and never see `timestep`.
   //
   // 6B parameters do not fit a single HTP context at any supported weight
   // width, so the DiT is exported as N pieces cut between transformer blocks.
   // The chain is uniform and N is discovered on disk, not fixed here:
-  //   part 1    : (sample, timestep, context, text_mask) -> (hidden, emb)
-  //   part 1<k<N: (hidden, emb, timestep, text_mask)     -> (hidden)
-  //   part N    : (hidden, emb, timestep, text_mask)     -> (out_sample)
+  //   part 1    : (sample, timestep, context, pos_ids, attn_mask)
+  //                                                     -> (hidden, emb)
+  //   part 1<k<N: (hidden, emb, pos_ids, attn_mask)      -> (hidden)
+  //   part N    : (hidden, emb, pos_ids, attn_mask)      -> (out_sample)
   // A part is recognised as terminal purely by exposing an output named
   // `out_sample`, so a single-context export (N = 1, i.e. part 1 terminal)
   // needs no special case.
@@ -986,10 +996,35 @@ class QnnModel : public QnnSampleApp {
            nullptr;
   }
 
-  // part 1: (sample, timestep, context, text_mask) -> (hidden, emb), or
-  // straight to out_sample when the whole DiT fits one context.
+  // Binds the per-token RoPE coordinates (int32, bound directly like Anima's
+  // t5_ids) and the attention mask. Shared by every part of the chain.
+  bool writeZImagePositions(const qnn_wrapper_api::GraphInfo_t &graphInfo,
+                            const int32_t *pos_ids, const float *attn_mask,
+                            size_t tokens) {
+    Qnn_Tensor_t *pi =
+        findTensor(inputs, graphInfo.numInputTensors, "pos_ids");
+    if (!pi) {
+      QNN_ERROR("zimage dit: missing input 'pos_ids'");
+      return false;
+    }
+    const size_t want = tokens * zimage_rope_axes;
+    const size_t capacity = tensorElems(*pi);
+    if (want != capacity) {
+      QNN_ERROR("zimage dit: 'pos_ids' expects %zu elements, got %zu", capacity,
+                want);
+      return false;
+    }
+    memcpy(QNN_TENSOR_GET_CLIENT_BUF(*pi).data, pos_ids,
+           want * sizeof(int32_t));
+    return writeNamedFloat(graphInfo, "attn_mask", attn_mask, tokens);
+  }
+
+  // part 1: (sample, timestep, context, pos_ids, attn_mask) -> (hidden, emb),
+  // or straight to out_sample when the whole DiT fits one context.
   StatusCode executeZImageDitFirst(const float *sample, float timestep,
-                                   const float *context, const float *text_mask,
+                                   const float *context,
+                                   const int32_t *pos_ids,
+                                   const float *attn_mask, size_t tokens,
                                    std::vector<std::vector<float>> &state,
                                    float *out_sample) {
     if (!ensureIoTensors()) return StatusCode::FAILURE;
@@ -1003,8 +1038,7 @@ class QnnModel : public QnnSampleApp {
     if (!writeNamedFloat(graphInfo, "sample", sample, latent_elems) ||
         !writeNamedFloat(graphInfo, "timestep", &timestep, 1) ||
         !writeNamedFloat(graphInfo, "context", context, ctx_elems) ||
-        !writeNamedFloat(graphInfo, "text_mask", text_mask,
-                         zimage_text_seq_len))
+        !writeZImagePositions(graphInfo, pos_ids, attn_mask, tokens))
       return StatusCode::FAILURE;
 
     if (!runGraph(graphInfo, "zimage dit part1")) return StatusCode::FAILURE;
@@ -1013,8 +1047,10 @@ class QnnModel : public QnnSampleApp {
 
   // Every part after the first. `state` carries {hidden, emb} in and is updated
   // in place; a terminal part writes out_sample and leaves state untouched.
+  // No `timestep` here: `emb` already IS the timestep's adaLN vector.
   StatusCode executeZImageDitNext(std::vector<std::vector<float>> &state,
-                                  float timestep, const float *text_mask,
+                                  const int32_t *pos_ids,
+                                  const float *attn_mask, size_t tokens,
                                   float *out_sample) {
     if (!ensureIoTensors()) return StatusCode::FAILURE;
     auto graphInfo = (*m_graphsInfo)[0];
@@ -1028,9 +1064,7 @@ class QnnModel : public QnnSampleApp {
                          state[0].size()) ||
         !writeNamedFloat(graphInfo, kZImageStateNames[1], state[1].data(),
                          state[1].size()) ||
-        !writeNamedFloat(graphInfo, "timestep", &timestep, 1) ||
-        !writeNamedFloat(graphInfo, "text_mask", text_mask,
-                         zimage_text_seq_len))
+        !writeZImagePositions(graphInfo, pos_ids, attn_mask, tokens))
       return StatusCode::FAILURE;
 
     if (!runGraph(graphInfo, "zimage dit part")) return StatusCode::FAILURE;

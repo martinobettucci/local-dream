@@ -65,6 +65,15 @@ inline constexpr float zimage_vae_shift_factor = 0.1159f;
 // consumes is sigma * 1000, not sigma.
 inline constexpr float zimage_flow_shift = 3.0f;
 inline constexpr float zimage_timestep_scale = 1000.0f;
+// S3-DiT patchification: 2x2 latent patches become one token, so a 128x128
+// latent yields 64x64 = 4096 image tokens. Captions are padded to a multiple of
+// SEQ_MULTI_OF before being positioned.
+inline constexpr int zimage_patch_size = 2;
+inline constexpr int zimage_seq_multiple = 32;
+// 3D RoPE over (t, h, w) — axes_dims [32,48,48], axes_lens [1536,512,512].
+inline constexpr int zimage_rope_axes = 3;
+inline constexpr int zimage_rope_axis_len_t = 1536;
+
 // Upper bound on how many pieces the DiT may be exported into
 // (unet_part1.bin .. unet_partN.bin). 6B parameters do not fit one HTP context
 // at any supported weight width, so the split count is a property of the

@@ -152,6 +152,9 @@ length.
 
 The DiT is cut between transformer blocks. The chain is uniform:
 
+`T` is the unified sequence length: `S` caption slots followed by
+`(H/2)·(W/2)` image tokens — 512 + 4096 = 4608 at 1024x1024.
+
 **Part 1**
 
 | | name | shape |
@@ -159,7 +162,8 @@ The DiT is cut between transformer blocks. The chain is uniform:
 | in | `sample` | `[1, C, H, W]` |
 | in | `timestep` | `[1]` — this is `sigma * 1000`, not sigma |
 | in | `context` | `[1, S, D]` |
-| in | `text_mask` | `[1, S]` |
+| in | `pos_ids` | `[1, T, 3]` int32 — 3D RoPE coordinates `(t, h, w)` |
+| in | `attn_mask` | `[1, T]` — 1 real token, 0 padded caption slot |
 | out | `hidden` | `[1, T, 3840]` — the fused caption+image token stream |
 | out | `emb` | `[1, 3840]` — the timestep modulation vector |
 
@@ -169,10 +173,22 @@ The DiT is cut between transformer blocks. The chain is uniform:
 |---|---|---|
 | in | `hidden` | `[1, T, 3840]` |
 | in | `emb` | `[1, 3840]` |
-| in | `timestep` | `[1]` |
-| in | `text_mask` | `[1, S]` |
+| in | `pos_ids` | `[1, T, 3]` int32 |
+| in | `attn_mask` | `[1, T]` |
 | out | `hidden` | `[1, T, 3840]` (non-terminal parts) |
 | out | `out_sample` | `[1, C, H, W]` (terminal part only) |
+
+`pos_ids` is an input, not a constant, and this is the one part of the contract
+most likely to be "simplified" by mistake. The reference pipeline drops padded
+caption rows before the DiT sees them, so the caption length varies per prompt,
+and image tokens are positioned at `cap_len + 1` — every image token's `t`
+coordinate therefore moves with the prompt. Baking the coordinates in as though
+the caption were always 512 long measurably changes the output (§9). The RoPE
+frequency tables themselves are fixed and should be baked in as initializers,
+indexed by `pos_ids`.
+
+Later parts take no `timestep`: `emb` already is the timestep's adaLN vector,
+computed once by part 1 and reused by every block.
 
 Rules the runner enforces:
 
@@ -182,19 +198,19 @@ Rules the runner enforces:
 - Non-terminal parts must emit `hidden`. They may re-emit `emb`, but do not have
   to: `emb` is constant across the chain and the host re-supplies the copy part
   1 produced.
-- `timestep` and `text_mask` are re-supplied to every part rather than threaded
-  through the handoff. This is deliberate, and follows what the Anima split
-  found the hard way: passing precomputed adaLN/RoPE tensors as flat graph
-  inputs forces the residual stream into a slow HTP layout. Recompute them
-  inside each part from `timestep`.
+- `pos_ids` and `attn_mask` are re-supplied to every part rather than threaded
+  through the handoff, since they are small and prompt-dependent. Build the
+  RoPE cos/sin inside each part by gathering the baked tables with `pos_ids`;
+  the Anima split found that passing large precomputed adaLN/RoPE tensors as
+  flat graph inputs forces the residual stream into a slow HTP layout.
 - Because the stream is single-stream, `context` is **not** an input past part 1
   — the caption tokens are already inside `hidden`.
 - Handoff shapes are checked against the graph's declared tensor sizes at run
   time; a mismatch is reported rather than memcpy'd.
 
-`T` is up to you (it is whatever your patchify + concat produces, nominally
-`S + (H/2)·(W/2)` = 512 + 4096 = 4608). The runner never assumes a value for it;
-it sizes the handoff from the graph.
+The runner sizes the `hidden`/`emb` handoff from the graph's own declared
+tensor shapes, so the exact hidden layout is yours to choose; it does assume
+`T = S + (H/2)·(W/2)` when building `pos_ids` and `attn_mask`.
 
 ### `vae_decoder.bin` / `vae_encoder.bin` — Flux AutoencoderKL
 
@@ -388,6 +404,34 @@ shards, plus 8.05 GB for the Qwen3-4B text encoder and 0.17 GB for the VAE —
 33 GB before any ONNX intermediate. Converting on a 30 GB volume means
 downloading shard by shard, casting to fp16, writing out per-part weights and
 deleting each shard as you go.
+
+**Caption length changes the image, so positions must be inputs.** The
+reference keeps only unmasked caption rows (`prompt_embeds[i][prompt_masks[i]]`),
+pads that to a multiple of `SEQ_MULTI_OF` (32), and starts the image tokens at
+`cap_len + 1`. A static graph has to fix the caption at 512 slots, which would
+pin every image token's `t` coordinate at 513 regardless of the prompt.
+
+Measured on the toy model, holding caption content and attention mask identical
+and varying only the padded length:
+
+| caption padded to | mean relative difference vs. reference |
+|---|---|
+| 32 (what the reference does for a 12-token prompt) | — |
+| 64 | 6.4 % |
+| 128 | 10.4 % |
+| 512 | 16.0 % |
+
+Random weights, so the percentages say nothing about perceptual damage — but
+the mechanism is real and would apply to every prompt shorter than 512 tokens,
+i.e. essentially all of them. Hence `pos_ids` as a graph input, computed host
+side in `PipelineZImage::buildPositions`.
+
+One thing to watch when writing the static wrapper: in diffusers 0.39.0
+`patchify_and_embed` passes the *already padded* caption length as
+`pos_grid_size` to `_pad_with_ids`, which then appends `pad_len` more
+coordinates on top — so for any caption that is not already a multiple of 32,
+`pos_ids` comes out longer than the padded features. Do not copy that shape
+arithmetic verbatim; derive the coordinates as this runner does.
 
 **Validation.** None of this can be checked without a Snapdragon device. A
 converted model that loads and produces an image still needs comparing against
