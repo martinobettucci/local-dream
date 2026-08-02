@@ -28,6 +28,7 @@ library_name: local-dream
 > | Graphs accepted by `qairt-converter` | ✅ |
 > | Quantization error after w4a16 | ❌ never measured |
 > | Runs on an NPU at all | ❌ never attempted |
+| Whether 8 Gen 2 (v73) has the headroom for a 6B DiT | ❌ unknown |
 > | Output image quality | ❌ unknown |
 >
 > If it does not work, that is expected rather than surprising. Please open an
@@ -55,7 +56,10 @@ Z-Image.
 
 ## Requirements
 
-- Snapdragon 8 Gen 3 or newer (Hexagon v75+)
+- Snapdragon 8 Gen 2 or newer. The context binaries are built for **Hexagon
+  v73** (8 Gen 2), which also runs on v75 (8 Gen 3) and v79 (8 Elite) — a
+  binary built for a *newer* Hexagon will not load on an older one, which is
+  why v73 is the target rather than v75.
 - **16 GB RAM** recommended; 12 GB needs *DiT sequential loading* in settings
 - A Local Dream build with `--type zimage` support
 

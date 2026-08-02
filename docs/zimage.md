@@ -535,6 +535,14 @@ Remaining for a shippable model: `qairt-quantizer --weights_bitwidth 4
 The quantizer needs a calibration input list — representative `sample`,
 `context`, `pos_ids`, `attn_mask` and `cap_pad_mask` tensors as raw files.
 
+**Target the OLDEST Hexagon you intend to support.** Context binaries are
+compiled per Hexagon version and do not run on an older one:
+8 Gen 2 (SM8550) is v73, 8 Gen 3 (SM8650) is v75, 8 Elite (SM8750) is v79. A
+v75 build installs fine on an 8 Gen 2 and then fails to load. Note the app's
+own `isSdxlCapableSoc()` list starts at 8 Gen 3, so an 8 Gen 2 never sees the
+built-in SDXL cards either — it can still run imported custom NPU models, which
+is why a device can "run SDXL" while showing none of the built-in SDXL entries.
+
 **Validation.** None of this can be checked without a Snapdragon device. A
 converted model that loads and produces an image still needs comparing against
 the reference pipeline before it is worth publishing.
