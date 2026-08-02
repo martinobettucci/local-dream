@@ -340,31 +340,46 @@ runtime libraries are produced by a separate CMake build and are *gitignored*
 on a fresh clone therefore succeeds but yields an APK **with no native library
 in it**, which cannot run any model. The native build has to happen first.
 
-Prerequisites, with the traps that cost the most time:
+### The short version
 
-- Android SDK (`compileSdk 37`), JDK 21, Gradle 9.3.1 (via the wrapper).
+```bash
+git clone https://github.com/martinobettucci/local-dream && cd local-dream
+./tools/zimage/setup_build_env.sh --build
+```
+
+That script is the executable form of everything below. On a clean Ubuntu 24.04
+box it pulls ~12 GB, occupies ~25 GB, and takes about 45 minutes.
+
+### What it does, and why each step is there
+
+- **Android SDK** (`compileSdk 37`), JDK 21, Gradle 9.3.1 (via the wrapper).
   **The package is `platforms;android-37.0`, not `platforms;android-37`** —
   platform packages are minor-versioned, and sdkmanager's error for the wrong
   name is just `Failed to find package`. `--channel=1` will happily *list*
   packages it then refuses to *install*; if in doubt, read the real package
   names out of `https://dl.google.com/android/repository/repository2-3.xml`.
-- **Rust 1.81** for `tokenizers-cpp`. Its `tokenizers-c` crate trips
-  `implicit autoref creates a reference to the dereference of a raw pointer`,
-  which newer rustc (1.94 here) makes a hard error — `RUSTFLAGS=-A ...` does not
-  suppress it. `rustup override set 1.81.0` in the repo root is the fix; do not
-  patch the vendored source. `rustup target add aarch64-linux-android` is also
-  required, or the build dies on `can't find crate for 'core'`.
-- Android NDK **r28** at `/data/android-ndk-r28`, or `ANDROID_NDK_ROOT` set
-  (see `app/src/main/cpp/CMakePresets.json`)
-- Qualcomm AI Engine Direct SDK **2.39.0.250926** at `/data/qairt/2.39.0.250926`
-  (path hardcoded as `QNN_SDK_ROOT` in `app/src/main/cpp/CMakeLists.txt`).
-  This one is not optional and not publicly downloadable — it requires a
-  Qualcomm Developer account. Without it the CMake configure step fails
-  immediately at the `file(COPY ${QNN_SDK_ROOT}/...)` calls.
-- `ninja`, `ccache`
-- A Rust toolchain (for the `tokenizers-cpp` submodule)
+- **Rust 1.85.0** for `tokenizers-cpp`, pinned in `rust-toolchain.toml`. The
+  window is narrow at both ends: newer rustc makes `implicit autoref creates a
+  reference to the dereference of a raw pointer` a hard error, which its
+  `tokenizers-c` crate trips in two places and `RUSTFLAGS=-A ...` does not
+  suppress; older than 1.82 fails on `is_none_or` with E0658. Do not patch the
+  vendored source — it would not survive a submodule update.
+  `rustup target add aarch64-linux-android` is also required, or the build dies
+  on `can't find crate for 'core'`.
+- **Android NDK r28**, symlinked to `/data/android-ndk-r28` because
+  `app/src/main/cpp/CMakePresets.json` hardcodes that path (`ANDROID_NDK_ROOT`
+  in its `environment` block overrides the ambient variable, so exporting one
+  is not enough).
+- **Qualcomm AI Runtime 2.39.0.250926** at `/data/qairt/2.39.0.250926`, also
+  hardcoded, as `QNN_SDK_ROOT` in `app/src/main/cpp/CMakeLists.txt`. The
+  *Community* edition needs no Qualcomm account — see section 9. Without it
+  CMake fails immediately at the `file(COPY ${QNN_SDK_ROOT}/...)` calls.
+- **`ninja` and `ccache`**, which are not a nicety: the native tree is MNN plus
+  xtensor plus the QNN SampleApp.
+- **All ten submodules.** A missing one surfaces as a not-found header rather
+  than as a submodule error.
 
-Steps:
+Steps, if running them by hand:
 
 ```bash
 git submodule update --init --recursive     # MNN, tokenizers-cpp, zstd, xtensor, ...
@@ -590,3 +605,52 @@ insurance: 6 GB was enough here to stop the OOM recurring.
 **Validation.** None of this can be checked without a Snapdragon device. A
 converted model that loads and produces an image still needs comparing against
 the reference pipeline before it is worth publishing.
+
+**The split count is a property of the converting machine, not the phone.**
+`qairt-quantizer` holds a whole part plus one calibration sample's activations,
+and was OOM-killed at 19 GB (15 GB RAM + 4 GB swap) on a 4-block part. Nothing
+about the weight width changes that — w2, w4 and w8 all calibrate identically.
+The only lever is how many blocks a part contains, so the split is chosen from
+measured peak RSS rather than from what looks tidy:
+
+```bash
+export HF_TOKEN=...
+PY=.zimage-env/exportvenv/bin/python QNN=.zimage-env/qnnvenv/bin/python \
+  ./tools/zimage/convert_all.sh /scratch 15 4 v73
+```
+
+`convert_part.sh` records peak RSS and wall clock per stage to
+`<work>/stats/partN.tsv`, and `convert_all.sh` prints the worst case across
+every part it built. Pick the smallest part count whose quantize stage fits with
+headroom; more parts is not free on device, since each one is a context switch
+and a full residual-stream copy across the graph boundary on every step.
+
+`zimage_max_dit_parts` (Config.hpp) caps this at 32, which admits one block per
+part — the finest split the 30-block model allows.
+
+**Weights are read over HTTP ranges, not downloaded.** The transformer is
+24.6 GB of fp32 across three shards, and the old flow downloaded each shard,
+sliced it into per-part fp16 files and deleted it: ~12 GB of intermediate for a
+model whose converted form is 3 GB. safetensors is trivially range-readable —
+8-byte little-endian header length, JSON header of `{name: {dtype, shape,
+data_offsets}}`, then the data — so `tools/zimage/remote_safetensors.py` fetches
+exactly the tensors a part needs and nothing else. Reading one DiT block costs
+~360 MB of transfer and zero disk. Verified bit-exact against a downloaded copy
+on all 244 VAE tensors, including the bf16 path (no numpy bf16, so it is read as
+uint16 and bit-cast).
+
+**Every part is uploaded the moment it is built.** `convert_all.sh` pushes each
+context binary to the Hub under `partial/` and deletes it locally, then resumes
+from the first gap in the remote listing. Two problems, one answer: peak disk
+becomes one part's intermediates instead of the whole model, and a conversion
+box that is reclaimed mid-run — which is the normal outcome on ephemeral
+infrastructure — costs one part rather than the run. Per-part stats go up
+alongside as `partial/stats/partN.tsv`.
+
+**Watch out for `delattr` on a reduced model.** A middle part traces neither the
+embedders nor the final layer, so `export_dit.py` deletes those submodules
+before loading the state dict — otherwise a 2-block part carries over a GB of
+randomly-initialised fp32 through ONNX export. Any validation that touches them
+unconditionally then fails with `'ZImageTransformer2DModel' object has no
+attribute 'all_x_embedder'`; the checks in `StaticZImageDiT.__init__` are gated
+on `first` / `last` for exactly this reason.

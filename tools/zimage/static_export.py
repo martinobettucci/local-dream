@@ -75,8 +75,6 @@ class StaticZImageDiT(nn.Module):
         super().__init__()
         self.m = model
         self.key = f"{patch}-{f_patch}"
-        if self.key not in model.all_x_embedder:
-            raise KeyError(f"model has no {self.key} embedder; has {list(model.all_x_embedder)}")
         self.cap_slots = int(cap_slots)
         self.p, self.fp = int(patch), int(f_patch)
         self.C = int(model.config.in_channels)
@@ -102,6 +100,15 @@ class StaticZImageDiT(nn.Module):
         # is really neither, so the caller states which it is.
         self.first = (self.block_start == 0) if first is None else bool(first)
         self.last = (self.block_end == n_layers) if last is None else bool(last)
+
+        # Checked here rather than up front because a middle part has neither
+        # module: export_dit.py deletes them before loading so a 2-block part
+        # does not carry a GB of untraced, randomly-initialised weights through
+        # ONNX export. Only a part that will actually index them needs them.
+        if self.first and self.key not in model.all_x_embedder:
+            raise KeyError(f"no {self.key} embedder; has {list(model.all_x_embedder)}")
+        if self.last and self.key not in model.all_final_layer:
+            raise KeyError(f"no {self.key} final layer; has {list(model.all_final_layer)}")
 
     # -- pieces ------------------------------------------------------------
     # The obvious transcription of _patchify_image / unpatchify is a 7-D view
