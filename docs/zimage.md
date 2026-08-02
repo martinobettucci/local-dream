@@ -511,6 +511,19 @@ to the 7-D form in both directions. Mind the ordering: pixel_(un)shuffle is CRD
 (channel-major) while a Z-Image token is `(pH, pW, C)`, so a reshape/permute
 pair converts between them.
 
+**The DiT conversion path is proven end to end** (on the real 6B weights, not a
+toy): 24.6 GB fp32 -> per-part fp16 -> StaticZImageDiT -> ONNX (external-data
+format, ~2.1 GB/part) -> `qairt-converter` -> `INFO_CONVERSION_SUCCESS`, a
+2.18 GB float DLC for part 8. Two harmless warnings on the way: `GEMM operation
+is not supported in the general case, attempting to interpret as FC`, and
+`Unused Input nodes found: []`.
+
+Remaining for a shippable model: `qairt-quantizer --weights_bitwidth 4
+--act_bitwidth 16 --input_list <calib>` per part, then
+`qnn-context-binary-generator` per part, then the same for Qwen3-4B and the VAE.
+The quantizer needs a calibration input list — representative `sample`,
+`context`, `pos_ids`, `attn_mask` and `cap_pad_mask` tensors as raw files.
+
 **Validation.** None of this can be checked without a Snapdragon device. A
 converted model that loads and produces an image still needs comparing against
 the reference pipeline before it is worth publishing.
