@@ -39,6 +39,20 @@ A conversion of [Tongyi-MAI/Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-I
 — to Qualcomm QNN context binaries, for the `zimage` backend in
 [Local Dream](https://github.com/xororz/local-dream).
 
+## The APK
+
+`LocalDream-zimage-2.8.1-arm64-v8a-UNTESTED-debug.apk` in this repo is a build
+of Local Dream with `--type zimage` support compiled in — the stock releases do
+not have it, so the weights below need this build (or your own from source).
+
+It is a **debug** build: installable and signed with the standard Android debug
+key, so it coexists with a Play/release install rather than upgrading it.
+arm64-v8a only. Sideload with `adb install <apk>` or a file manager.
+
+The Z-Image runner inside it has never executed a single graph. Installing it
+and reaching the model list proves the app works; it proves nothing about
+Z-Image.
+
 ## Requirements
 
 - Snapdragon 8 Gen 3 or newer (Hexagon v75+)
