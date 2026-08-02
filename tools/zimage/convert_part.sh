@@ -27,8 +27,15 @@ PY="${PY:?set PY to the torch venv python}"
 QNN="${QNN:?set QNN to the python3.10 venv python}"
 
 ODIR="$W/onnx/part$N"; OUT="$W/out"; STATS="$W/stats"; mkdir -p "$OUT" "$STATS"
-free_gb() { df -BG --output=avail / | tail -1 | tr -dc '0-9'; }
+free_gb() { df -BG --output=avail "$W" | tail -1 | tr -dc '0-9'; }
 say() { echo "[part$N/$NPARTS] $* (free $(free_gb)G)"; }
+
+# A context binary is hundreds of MB; anything much smaller is a run that died
+# mid-write, and the resume gate must not accept it -- convert_all.sh would
+# publish the truncated file and delete the local copy, making the damage
+# permanent and invisible.
+MIN_BIN_BYTES="${MIN_BIN_BYTES:-1048576}"
+bin_ok() { [ -f "$1" ] && [ "$(stat -c%s "$1")" -ge "$MIN_BIN_BYTES" ]; }
 
 # Peak RSS and wall clock per stage, appended to a per-part TSV. This is the
 # measurement that decides how many parts the split needs; without it the answer
@@ -52,7 +59,8 @@ run() {
   return $rc
 }
 
-if [ -f "$OUT/unet_part$N.bin" ]; then say "already built, skipping"; exit 0; fi
+if bin_ok "$OUT/unet_part$N.bin"; then say "already built, skipping"; exit 0; fi
+rm -f "$OUT/unet_part$N.bin"   # present but too small: a dead run, not a result
 : > "$TSV"
 
 say "1/5 export ONNX"
@@ -112,7 +120,7 @@ run context "$BIN/qnn-context-binary-generator" --dlc_path "$W/unet_part${N}_q.d
     --config_file "$W/ext_$ARCH.json" --output_dir "$OUT" \
     --binary_file "unet_part$N" > "$W/ctx$N.log" 2>&1 \
     || { echo "context binary FAILED:"; tail -20 "$W/ctx$N.log"; exit 1; }
-[ -s "$OUT/unet_part$N.bin" ] || { echo "no .bin:"; tail -20 "$W/ctx$N.log"; exit 1; }
+bin_ok "$OUT/unet_part$N.bin" || { echo "no usable .bin (got $(stat -c%s "$OUT/unet_part$N.bin" 2>/dev/null || echo 0) bytes):"; tail -20 "$W/ctx$N.log"; exit 1; }
 rm -f "$W/unet_part${N}_q.dlc"
 say "5/5 done -> $(stat -c%s "$OUT/unet_part$N.bin") bytes"
 printf 'peak RSS across stages: %s MB\n' \

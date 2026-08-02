@@ -167,15 +167,31 @@ def build_chunk(cfg, readers, weight_map, a, b, first, last):
 def dump_token_emb(work, readers, weight_map):
     """fp16 [vocab, hidden] row-major, exactly what the app mmaps."""
     out = os.path.join(work, "token_emb.bin")
-    if os.path.exists(out):
-        log(f"token_emb.bin already present ({os.path.getsize(out) / 1e6:.0f} MB)")
-        return out
     name = "model.embed_tokens.weight"
     shard = weight_map[name]
+    rows, cols = readers[shard].header[name]["shape"]
+    want = rows * cols * 2                       # fp16
+
+    # Size-checked, not existence-checked. This is a 778 MB write; an
+    # interrupted one leaves a short file that the app mmaps at its declared
+    # [vocab, 2560] extent and reads straight off the end. A resume that trusts
+    # mere existence turns a dead download into a device-side crash.
+    if os.path.exists(out):
+        have = os.path.getsize(out)
+        if have == want:
+            log(f"token_emb.bin already complete ({have / 1e6:.0f} MB)")
+            return out
+        log(f"token_emb.bin is {have} bytes, expected {want} — rebuilding")
+        os.remove(out)
+
     log(f"fetching {name} from {shard}")
     t = readers[shard].get_tensors([name], dtype=torch.float16)[name]
     log(f"  {tuple(t.shape)} fp16 -> {out}")
     t.numpy().tofile(out)
+    got = os.path.getsize(out)
+    if got != want:
+        os.remove(out)
+        raise RuntimeError(f"token_emb.bin wrote {got} bytes, expected {want}")
     del t
     gc.collect()
     return out

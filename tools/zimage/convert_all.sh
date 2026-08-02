@@ -21,7 +21,13 @@ W="${1:?work dir}"; NPARTS="${2:?number of parts}"
 WBITS="${3:-4}"; ARCH="${4:-v73}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HF_REPO="${HF_REPO:-P2Enjoy/z-image-turbo-qnn}"
-REMOTE_DIR="${REMOTE_DIR:-partial}"
+# The split count is part of the remote path, not just the filename. "part 15"
+# means block 14 in a 30-way split and blocks 14-15 in a 15-way split, and the
+# split count has already changed three times as the RAM ceiling was measured.
+# Without this, resuming after a change would skip parts built under the old
+# plan and assemble a model out of two incompatible splits -- silently, since
+# every file would be present and correctly named.
+REMOTE_DIR="${REMOTE_DIR:-partial/n$NPARTS}"
 PY="${PY:?set PY to the torch venv python}"
 QNN="${QNN:?set QNN to the python3.10 venv python}"
 KEEP_LOCAL="${KEEP_LOCAL:-0}"
