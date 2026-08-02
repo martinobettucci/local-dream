@@ -569,9 +569,25 @@ The calibration `--input_list` is a text file with one line per sample, each
 line `input_name:=/abs/path/sample.raw`, the raw being a bare fp32 dump of the
 input tensor.
 
-Useful side effect: the generator prints a DDR bandwidth summary including
-`spill_bytes`, which is exactly the number `LOCALDREAM_ZIMAGE_SPILL_FILL_BYTES`
-wants. The VAE decoder reported `spill_bytes=436371456`.
+The generator prints a DDR bandwidth summary including `spill_bytes`. That is
+**total spill traffic during compilation, not a buffer size** — do not feed it
+to `LOCALDREAM_ZIMAGE_SPILL_FILL_BYTES`. The same VAE decoder reports 436 MB at
+256px and 19 GB at 1024px, which makes the scaling obvious once you see both.
+The buffer size still has to come from the runtime `querySpillFillSize()` or
+from the "smaller than required spill-fill size N" message on a failed context
+creation.
+
+**Memory is the binding constraint, not time.** `qairt-quantizer` holds
+activations for every calibration sample, and at 1024x1024 that is enough to
+OOM a 15 GB box on the *smallest* graph in the model:
+
+    Out of memory: Killed process (python) anon-rss:15740160kB
+
+Dropping `--input_list` from 4 samples to 1 fixed it. Measured on the 1024px VAE
+decoder, w8a16, Hexagon v73: convert 13 s, quantize 3m39s, context binary
+18m25s, output 198 MB. Note the context-binary step dominates and scales with
+graph size, so budget accordingly for the DiT parts. Adding swap is worthwhile
+insurance: 6 GB was enough here to stop the OOM recurring.
 
 **Validation.** None of this can be checked without a Snapdragon device. A
 converted model that loads and produces an image still needs comparing against
