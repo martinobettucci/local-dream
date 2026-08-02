@@ -3,18 +3,25 @@
 
 Constraints this is built around:
 
-  * The released transformer is fp32 across three shards, 24.6 GB. It cannot be
-    held in RAM (15 GB here) and barely fits on disk, so shards are fetched one
-    at a time, split into per-part fp16 weight files, and deleted.
-  * Each part is then built as a REDUCED ZImageTransformer2DModel holding only
-    its own blocks, so peak RAM is one part rather than the whole model.
+  * The released transformer is fp32 across three shards, 24.6 GB. Earlier
+    versions of this script downloaded each shard, sliced it into per-part
+    weight files and deleted it — which needs ~12 GB of disk for the parts
+    alone, and re-downloads a shard for every part that touches it. Instead the
+    weights are now read straight out of the remote safetensors with HTTP range
+    requests (see remote_safetensors.py): one part costs its own size in
+    transfer and nothing on disk.
+  * Each part is built as a REDUCED ZImageTransformer2DModel holding only its
+    own blocks, with the modules it does not trace deleted outright, so peak RAM
+    is one part rather than the whole model.
   * Every stage is skipped if its output already exists, so the script is
     resumable — which matters when a full run is measured in hours.
 
-    python tools/zimage/export_dit.py --work /path/to/scratch --parts 8
+    python tools/zimage/export_dit.py --work /path/to/scratch --parts 30 --only 4
 
-Produces work/onnx/unet_partK.onnx plus a manifest. Feeding those to
-qairt-converter / qnn-context-binary-generator is convert_qnn.py's job.
+The part count is free to choose. It trades peak memory during quantization —
+which is what actually caps this, `qairt-quantizer` was OOM-killed at 19 GB on a
+4-block part — against per-part fixed overhead and the number of context
+switches per step on device. See docs/zimage.md.
 """
 import argparse
 import gc
@@ -35,6 +42,14 @@ LATENT = 128          # 1024 / 8
 DIM = 3840
 CAP_FEAT_DIM = 2560
 
+# Modules a part only needs when it owns the head or the tail of the model.
+# Deleting the rest after construction is not just tidiness: at dim 3840 the two
+# refiner stacks and the embedders are well over a GB of randomly-initialised
+# fp32 that a middle part would otherwise carry through ONNX export.
+FIRST_ONLY = ("all_x_embedder", "cap_embedder", "t_embedder",
+              "noise_refiner", "context_refiner")
+LAST_ONLY = ("all_final_layer",)
+
 
 def log(msg):
     print(f"[export_dit] {msg}", flush=True)
@@ -49,6 +64,8 @@ def plan_parts(n_parts, n_layers=N_LAYERS):
     """Contiguous, near-equal block ranges. Part 1 and part N carry the extra
     embedder / final-layer work, so they get one fewer block where it divides
     unevenly."""
+    if not 1 <= n_parts <= n_layers:
+        raise ValueError(f"n_parts must be in 1..{n_layers}, got {n_parts}")
     base, extra = divmod(n_layers, n_parts)
     cuts, at = [], 0
     for i in range(n_parts):
@@ -63,99 +80,69 @@ def plan_parts(n_parts, n_layers=N_LAYERS):
     return cuts
 
 
-def shard_to_parts(work, cuts):
-    """Stream the three shards into per-part fp16 weight files.
+def target_part(name, cuts):
+    """Which part owns a checkpoint tensor, and what it is called there.
 
-    Non-block tensors (embedders, refiners, final layer, pad tokens) go to the
-    first or last part as appropriate. Block tensors are renumbered so each part
-    sees its layers as 0..k.
+    Block tensors are renumbered so every part sees its layers as 0..k, which is
+    what lets a part load into a model built with n_layers = its own count.
     """
-    from huggingface_hub import hf_hub_download
-    from safetensors import safe_open
-    from safetensors.torch import save_file
-
-    wdir = os.path.join(work, "parts")
-    os.makedirs(wdir, exist_ok=True)
-    done = os.path.join(wdir, ".complete")
-    if os.path.exists(done):
-        log("per-part weights already built, skipping shard pass")
-        return wdir
-
-    index = hf_hub_download(REPO, f"{SUBDIR}/diffusion_pytorch_model.safetensors.index.json")
-    weight_map = json.load(open(index))["weight_map"]
-    shards = sorted(set(weight_map.values()))
-    log(f"{len(weight_map)} tensors across {len(shards)} shards")
-
     n_parts = len(cuts)
+    m = re.match(r"layers\.(\d+)\.(.*)", name)
+    if m:
+        layer, rest = int(m.group(1)), m.group(2)
+        for pi, (a, b) in enumerate(cuts):
+            if a <= layer < b:
+                return pi, f"layers.{layer - a}.{rest}"
+        raise KeyError(f"layer {layer} outside {cuts}")
+    if name.startswith(LAST_ONLY):
+        return n_parts - 1, name
+    # everything else (embedders, refiners, t_embedder, pad tokens) is part 1
+    return 0, name
 
-    def target_part(name):
-        m = re.match(r"layers\.(\d+)\.(.*)", name)
-        if m:
-            layer, rest = int(m.group(1)), m.group(2)
-            for pi, (a, b) in enumerate(cuts):
-                if a <= layer < b:
-                    return pi, f"layers.{layer - a}.{rest}"
-            raise KeyError(f"layer {layer} outside {cuts}")
-        if name.startswith("all_final_layer"):
-            return n_parts - 1, name
-        # everything else (embedders, refiners, t_embedder, pad tokens) is part 1
-        return 0, name
 
-    # How many tensors each part expects, so a part can be flushed to disk the
-    # moment it is complete. Holding all of them would mean ~12 GB of fp16 in
-    # RAM against 15 GB total; layers are contiguous and shards are ordered, so
-    # in practice only a part or two is ever pending.
-    expected = [0] * n_parts
-    for name in weight_map:
-        expected[target_part(name)[0]] += 1
-    log(f"tensors per part: {expected}")
+def fetch_part_weights(readers, weight_map, cuts, pi, cache=None):
+    """This part's tensors, fp16, pulled over HTTP range reads.
 
-    acc = [dict() for _ in range(n_parts)]
-    written = [False] * n_parts
+    Grouped by shard so each shard's ranges are coalesced into as few requests
+    as possible; cast to fp16 as each range lands so the fp32 original is never
+    held for more than one run of tensors.
+    """
+    from safetensors.torch import load_file, save_file
 
-    def flush_complete():
-        for pi in range(n_parts):
-            if written[pi] or len(acc[pi]) != expected[pi]:
-                continue
-            out = os.path.join(wdir, f"part{pi + 1}.safetensors")
-            save_file(acc[pi], out)
-            log(f"  part{pi + 1} complete: {len(acc[pi])} tensors -> "
-                f"{os.path.getsize(out) / 1e9:.2f} GB")
-            acc[pi].clear()
-            written[pi] = True
-            gc.collect()
+    if cache and os.path.exists(cache):
+        log(f"  using cached weights {cache}")
+        return load_file(cache)
 
-    for shard in shards:
-        log(f"fetching {shard} (free {free_gb(work):.1f} GB)")
-        path = hf_hub_download(REPO, f"{SUBDIR}/{shard}")
-        with safe_open(path, framework="pt", device="cpu") as f:
-            for name in f.keys():
-                pi, newname = target_part(name)
-                acc[pi][newname] = f.get_tensor(name).to(torch.float16)
-        # hf_hub_download hands back a path inside the shared cache; drop the
-        # blob so the next shard has room.
-        real = os.path.realpath(path)
-        if os.path.exists(real):
-            os.remove(real)
-        if os.path.islink(path):
-            os.remove(path)
+    wanted = {}                                  # shard -> {ckpt name: part name}
+    for name, shard in weight_map.items():
+        owner, newname = target_part(name, cuts)
+        if owner == pi:
+            wanted.setdefault(shard, {})[name] = newname
+    if not wanted:
+        raise RuntimeError(f"part {pi + 1} matched no tensors")
+
+    total = sum(readers[s].nbytes(n) for s, ns in wanted.items() for n in ns)
+    log(f"  fetching {sum(len(v) for v in wanted.values())} tensors, "
+        f"{total / 1e9:.2f} GB fp32, from {len(wanted)} shard(s)")
+
+    sd = {}
+    for shard, names in wanted.items():
+        got = readers[shard].get_tensors(list(names), dtype=torch.float16)
+        for ckpt_name, tensor in got.items():
+            sd[names[ckpt_name]] = tensor
+        del got
         gc.collect()
-        flush_complete()
-        log(f"  released {shard} (free {free_gb(work):.1f} GB)")
-
-    if not all(written):
-        raise RuntimeError(f"parts never completed: "
-                           f"{[i + 1 for i, w in enumerate(written) if not w]}")
-    open(done, "w").close()
-    return wdir
+    if cache:
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        save_file(sd, cache)
+    return sd
 
 
-def build_part(weights_path, n_blocks, first, last):
+def build_part(sd, n_blocks, first, last):
     """A reduced model holding only this part's blocks, then the static wrapper."""
     import rope_real
     rope_real.apply()
     from diffusers import ZImageTransformer2DModel
-    from safetensors.torch import load_file
 
     from static_export import StaticZImageDiT
 
@@ -166,18 +153,26 @@ def build_part(weights_path, n_blocks, first, last):
         rope_theta=256.0, t_scale=1000.0,
         axes_dims=[32, 48, 48], axes_lens=[1536, 512, 512],
     )
-    sd = load_file(weights_path)
+    # Drop what this part will not trace before loading, so the randomly
+    # initialised originals are freed rather than merely overwritten.
+    drop = ([] if first else list(FIRST_ONLY)) + ([] if last else list(LAST_ONLY))
+    for attr in drop:
+        if hasattr(model, attr):
+            delattr(model, attr)
+    gc.collect()
+
     sd = {k: v.to(torch.float32) for k, v in sd.items()}
     missing, unexpected = model.load_state_dict(sd, strict=False)
+    del sd
+    gc.collect()
     # A middle part legitimately lacks embedders and the final layer; those
-    # modules exist on the reduced model but are never traced.
+    # modules have just been deleted, so they cannot show up as missing either.
     missing = [m for m in missing if not m.startswith("layers.")]
     if unexpected:
-        raise RuntimeError(f"unexpected tensors for {weights_path}: {unexpected[:5]}")
-    if first and any(m.startswith(("all_x_embedder", "cap_embedder", "t_embedder",
-                                   "noise_refiner", "context_refiner")) for m in missing):
+        raise RuntimeError(f"unexpected tensors for part: {unexpected[:5]}")
+    if first and any(m.startswith(FIRST_ONLY) for m in missing):
         raise RuntimeError(f"part 1 is missing embedder weights: {missing[:5]}")
-    if last and any(m.startswith("all_final_layer") for m in missing):
+    if last and any(m.startswith(LAST_ONLY) for m in missing):
         raise RuntimeError(f"last part is missing the final layer: {missing[:5]}")
     model.eval()
     return StaticZImageDiT(model, CAP_SLOTS, LATENT, LATENT,
@@ -195,22 +190,33 @@ def export_part(part, path, dim=DIM):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--work", required=True)
-    ap.add_argument("--parts", type=int, default=8)
+    ap.add_argument("--parts", type=int, default=30)
     ap.add_argument("--only", type=int, default=0, help="export just this part (1-based)")
+    ap.add_argument("--cache-weights", action="store_true",
+                    help="keep the fetched fp16 weights on disk (costs the whole "
+                         "model in disk; only worth it when re-exporting a part)")
+    ap.add_argument("--plan-only", action="store_true",
+                    help="print the block ranges and exit, fetching nothing")
     args = ap.parse_args()
 
     os.makedirs(args.work, exist_ok=True)
     cuts = plan_parts(args.parts)
     log(f"{args.parts} parts, block ranges {cuts}")
+    if args.plan_only:
+        return
 
-    wdir = shard_to_parts(args.work, cuts)
+    from remote_safetensors import open_shards
+
     odir = os.path.join(args.work, "onnx")
     os.makedirs(odir, exist_ok=True)
 
+    readers = weight_map = None
     manifest = []
     for pi, (a, b) in enumerate(cuts):
         n = pi + 1
+        entry = {"part": n, "blocks": [a, b]}
         if args.only and n != args.only:
+            manifest.append(entry)
             continue
         # Each part gets its own directory: parts above 2 GB are written in
         # ONNX external-data format, whose side files are named after the
@@ -221,22 +227,34 @@ def main():
         out = os.path.join(pdir, f"unet_part{n}.onnx")
         if os.path.exists(out):
             log(f"part{n} already exported, skipping")
-            manifest.append({"part": n, "blocks": [a, b], "onnx": out})
+            manifest.append({**entry, "onnx": out})
             continue
+
+        if readers is None:
+            log(f"opening {REPO} shard headers")
+            readers, weight_map = open_shards(REPO, SUBDIR)
+
         log(f"building part{n} (blocks {a}..{b}, free {free_gb(args.work):.1f} GB)")
-        part = build_part(os.path.join(wdir, f"part{n}.safetensors"),
-                          b - a, first=(pi == 0), last=(pi == len(cuts) - 1))
+        cache = os.path.join(args.work, "parts", f"part{n}.safetensors") \
+            if args.cache_weights else None
+        sd = fetch_part_weights(readers, weight_map, cuts, pi, cache=cache)
+        part = build_part(sd, b - a, first=(pi == 0), last=(pi == len(cuts) - 1))
+        del sd
+        gc.collect()
         log(f"  exporting -> {out}")
         export_part(part, out)
         size = sum(os.path.getsize(os.path.join(pdir, f)) for f in os.listdir(pdir))
-        log(f"  part{n} onnx {size / 1e9:.2f} GB")
-        manifest.append({"part": n, "blocks": [a, b], "onnx": out,
-                         "inputs": part.input_names, "outputs": part.output_names})
+        log(f"  part{n} onnx {size / 1e9:.2f} GB (free {free_gb(args.work):.1f} GB)")
+        manifest.append({**entry, "onnx": out, "inputs": part.input_names,
+                         "outputs": part.output_names})
         del part
         gc.collect()
 
+    # Written per invocation, so a --only run still records the full plan and a
+    # later run can tell how many parts the device should look for.
     mpath = os.path.join(args.work, "dit_manifest.json")
-    json.dump({"parts": manifest, "cap_slots": CAP_SLOTS, "latent": LATENT},
+    json.dump({"parts": manifest, "n_parts": len(cuts),
+               "cap_slots": CAP_SLOTS, "latent": LATENT},
               open(mpath, "w"), indent=2)
     log(f"manifest -> {mpath}")
 

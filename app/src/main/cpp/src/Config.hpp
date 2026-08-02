@@ -78,6 +78,12 @@ inline constexpr int zimage_rope_axis_len_t = 1536;
 // (unet_part1.bin .. unet_partN.bin). 6B parameters do not fit one HTP context
 // at any supported weight width, so the split count is a property of the
 // converted model, discovered on disk rather than fixed here.
-inline constexpr int zimage_max_dit_parts = 16;
+//
+// 32 rather than something tighter because the split count is set by the
+// *converting* machine's memory, not the phone's: qairt-quantizer holds a whole
+// part plus a calibration sample's activations, and was OOM-killed at 19 GB on
+// a 4-block part. One block per part is the finest useful split (30 blocks),
+// and this has to admit it.
+inline constexpr int zimage_max_dit_parts = 32;
 
 #endif  // CONFIG_HPP

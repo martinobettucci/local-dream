@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Convert every DiT part, checkpointing each one to the Hub as it completes.
+#
+# The conversion box is ephemeral and has less free disk than the finished model
+# needs. Both problems have the same answer: a part is uploaded the moment its
+# context binary exists and deleted locally, so peak disk is one part's
+# intermediates rather than the whole model, and a machine that dies mid-run
+# costs one part rather than the run.
+#
+# Restarting is therefore free and is the normal way to use this: it asks the
+# Hub what is already there and starts from the first gap.
+#
+#   export HF_TOKEN=...
+#   PY=... QNN=... ./convert_all.sh <work_dir> <n_parts> [bits] [dsp_arch]
+#
+# n_parts is the RAM lever — see the note in convert_part.sh. Peak RSS per
+# stage lands in <work_dir>/stats/partN.tsv and is summarised at the end.
+set -euo pipefail
+
+W="${1:?work dir}"; NPARTS="${2:?number of parts}"
+WBITS="${3:-4}"; ARCH="${4:-v73}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HF_REPO="${HF_REPO:-P2Enjoy/z-image-turbo-qnn}"
+REMOTE_DIR="${REMOTE_DIR:-partial}"
+PY="${PY:?set PY to the torch venv python}"
+QNN="${QNN:?set QNN to the python3.10 venv python}"
+KEEP_LOCAL="${KEEP_LOCAL:-0}"
+
+mkdir -p "$W/out" "$W/stats"
+free_gb() { df -BG --output=avail / | tail -1 | tr -dc '0-9'; }
+
+echo "==> $NPARTS parts, w${WBITS}a16, Hexagon $ARCH -> $HF_REPO/$REMOTE_DIR"
+"$PY" "$HERE/export_dit.py" --work "$W" --parts "$NPARTS" --plan-only
+
+# One listing for the whole run rather than one per part: this is the resume
+# point, and re-asking after every upload would only ever confirm what we just
+# did.
+DONE="$("$PY" "$HERE/upload_hf.py" --repo "$HF_REPO" --list-remote "$REMOTE_DIR/" 2>/dev/null || true)"
+echo "==> already on the Hub: $(echo "$DONE" | grep -c 'unet_part' || true) parts"
+
+for N in $(seq 1 "$NPARTS"); do
+  if echo "$DONE" | grep -qx "$REMOTE_DIR/unet_part$N.bin"; then
+    echo "==> part$N already published, skipping"
+    continue
+  fi
+  echo "==> part$N of $NPARTS (free $(free_gb)G)"
+  PY="$PY" QNN="$QNN" "$HERE/convert_part.sh" "$W" "$N" "$NPARTS" "$WBITS" "$ARCH"
+
+  "$PY" "$HERE/upload_hf.py" --repo "$HF_REPO" \
+      --put "$W/out/unet_part$N.bin" --as "$REMOTE_DIR/unet_part$N.bin"
+  # Uploaded means committed. Keeping it costs the disk the next part needs.
+  [ "$KEEP_LOCAL" = 1 ] || rm -f "$W/out/unet_part$N.bin"
+  "$PY" "$HERE/upload_hf.py" --repo "$HF_REPO" \
+      --put "$W/stats/part$N.tsv" --as "$REMOTE_DIR/stats/part$N.tsv" || true
+done
+
+echo
+echo "==> peak RSS by stage (MB), across all parts built on this machine"
+awk -F'\t' '{ if ($2 > peak[$1]) peak[$1] = $2; secs[$1] += $3 }
+     END { for (s in peak) printf "  %-9s %6d MB   %5d s total\n", s, peak[s]/1024, secs[s] }' \
+    "$W"/stats/part*.tsv 2>/dev/null | sort || echo "  (no parts built this run)"
+echo "==> https://huggingface.co/$HF_REPO/tree/main/$REMOTE_DIR"

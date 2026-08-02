@@ -59,6 +59,14 @@ def main():
     ap.add_argument("--repo", default=DEFAULT_REPO)
     ap.add_argument("--archive-out", default=None)
     ap.add_argument("--dry-run", action="store_true")
+    # Per-artifact modes, used by convert_all.sh to checkpoint each part to the
+    # Hub the moment it is built. The conversion box is ephemeral and has less
+    # free disk than the finished model needs, so "upload it and delete it" is
+    # the only way a long run survives either.
+    ap.add_argument("--put", help="upload a single file and exit")
+    ap.add_argument("--as", dest="remote", help="path in the repo for --put")
+    ap.add_argument("--list-remote", metavar="PREFIX", nargs="?", const="",
+                    help="print repo files under PREFIX and exit")
     args = ap.parse_args()
 
     from huggingface_hub import HfApi, get_token
@@ -66,6 +74,28 @@ def main():
     if not get_token():
         raise SystemExit("no HF token; run `huggingface-cli login` or set HF_TOKEN")
     api = HfApi()
+
+    if args.list_remote is not None:
+        try:
+            for f in api.list_repo_files(args.repo, repo_type="model"):
+                if f.startswith(args.list_remote):
+                    print(f)
+        except Exception:                      # repo does not exist yet
+            pass
+        return
+
+    if args.put:
+        remote = args.remote or os.path.basename(args.put)
+        if args.dry_run:
+            print(f"(dry-run) would upload {args.put} -> {remote}")
+            return
+        api.create_repo(args.repo, repo_type="model", exist_ok=True)
+        api.upload_file(path_or_fileobj=args.put, path_in_repo=remote,
+                        repo_id=args.repo, repo_type="model")
+        print(f"uploaded {remote} "
+              f"({os.path.getsize(args.put) / 1e6:.1f} MB)")
+        return
+
     who = api.whoami()
     print(f"authenticated as {who.get('name')}; target repo {args.repo}")
 
