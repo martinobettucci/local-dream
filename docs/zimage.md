@@ -172,7 +172,7 @@ backwards is silent.
 
 | | name | shape |
 |---|---|---|
-| in | `hidden` | `[1, T, 3840]` |
+| in | `hidden_in` | `[1, T, 3840]` |
 | in | `emb` | `[1, 256]` |
 | in | `pos_ids` | `[1, T, 3]` int32 |
 | in | `attn_mask` | `[1, T]` |
@@ -688,3 +688,15 @@ almost nothing on device: the text encoder runs once per generation and its
 result is prompt-cached, so the extra context switches are amortised over the
 whole image rather than paid on every step. It does mean `clip.bin` has to
 become a chain in the same way `unet_partN.bin` is.
+
+**`torch.onnx.export` renames colliding IO, and the app binds by name.** The
+natural contract for a middle DiT part is `hidden` in, `hidden` out. ONNX cannot
+express that — two graph values cannot share a name — and the exporter does not
+complain; it silently renames the *input* to `hidden.1`. That survives
+`qairt-converter`, survives quantization, survives the context binary, and
+finally shows up on device as a missing tensor. Hence `hidden_in` for the input
+and `hidden` for the output (`kZImageStateInNames` / `kZImageStateOutNames` in
+`QnnModel.hpp`), and hence `check_io_names()` in `export_dit.py`, which reloads
+each exported graph and fails the run if any IO name is not what was asked for.
+
+`input_names` and `output_names` are requests, not guarantees. Verify them.

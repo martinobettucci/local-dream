@@ -190,7 +190,30 @@ def export_part(part, path, dim=DIM):
     inputs = part.example_inputs(true_len=CAP_SLOTS, dim=dim)
     torch.onnx.export(part, inputs, path, opset_version=17, dynamo=False,
                       input_names=part.input_names, output_names=part.output_names)
+    check_io_names(path, part.input_names, part.output_names)
     return path
+
+
+def check_io_names(path, want_in, want_out):
+    """torch.onnx.export treats input_names/output_names as requests, not
+    guarantees. A name that collides with something already in the graph is
+    silently suffixed -- an input called `hidden` alongside an output of the
+    same name comes out as `hidden.1`. The app binds tensors by name, so that
+    rename survives conversion, survives quantization, and finally shows up as a
+    missing tensor on the device. Catch it here instead.
+    """
+    import onnx
+
+    m = onnx.load(path, load_external_data=False)
+    got_in = [i.name for i in m.graph.input]
+    got_out = [o.name for o in m.graph.output]
+    if got_in != list(want_in) or got_out != list(want_out):
+        raise RuntimeError(
+            f"ONNX IO names do not match the contract:\n"
+            f"  inputs  wanted {list(want_in)}\n"
+            f"          got    {got_in}\n"
+            f"  outputs wanted {list(want_out)}\n"
+            f"          got    {got_out}")
 
 
 def main():

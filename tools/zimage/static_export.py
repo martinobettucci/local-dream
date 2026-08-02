@@ -190,8 +190,12 @@ class StaticZImageDiT(nn.Module):
     # -- export metadata ---------------------------------------------------
     @property
     def input_names(self):
+        # "hidden_in", not "hidden": torch.onnx.export refuses to give a graph an
+        # input and an output with the same name and silently renames the input
+        # to "hidden.1", which the app -- which binds by name -- would only
+        # discover on device. Matches kZImageStateInNames in QnnModel.hpp.
         return (["sample", "timestep", "context", "pos_ids", "attn_mask", "cap_pad_mask"]
-                if self.first else ["hidden", "emb", "pos_ids", "attn_mask"])
+                if self.first else ["hidden_in", "emb", "pos_ids", "attn_mask"])
 
     @property
     def emb_dim(self):

@@ -943,7 +943,14 @@ class QnnModel : public QnnSampleApp {
   // A part is recognised as terminal purely by exposing an output named
   // `out_sample`, so a single-context export (N = 1, i.e. part 1 terminal)
   // needs no special case.
-  static constexpr const char *kZImageStateNames[2] = {"hidden", "emb"};
+  // The residual stream is named differently on the way in and on the way out,
+  // and that is forced rather than stylistic: torch.onnx.export cannot give a
+  // graph an input and an output with the same name, and silently renames the
+  // input to "hidden.1" if you try. Binding is by name, so that rename would
+  // only surface on device as a missing tensor. Inputs and outputs are separate
+  // arrays in GraphInfo_t, so nothing here depends on the two matching.
+  static constexpr const char *kZImageStateInNames[2] = {"hidden_in", "emb"};
+  static constexpr const char *kZImageStateOutNames[2] = {"hidden", "emb"};
   static constexpr const char *kZImageOutName = "out_sample";
 
   // Collects whatever the part produced. A terminal part writes the velocity
@@ -970,7 +977,7 @@ class QnnModel : public QnnSampleApp {
     bool saw_hidden = false;
     for (int k = 0; k < 2; ++k) {
       Qnn_Tensor_t *t = findTensor(outputs, graphInfo.numOutputTensors,
-                                   kZImageStateNames[k]);
+                                   kZImageStateOutNames[k]);
       // `emb` is constant for the whole chain, so only part 1 has to emit it;
       // later parts may omit it and keep the copy the host already holds.
       if (!t) continue;
@@ -982,12 +989,12 @@ class QnnModel : public QnnSampleApp {
     }
     if (!saw_hidden) {
       QNN_ERROR("zimage dit: part emitted neither '%s' nor '%s'",
-                kZImageOutName, kZImageStateNames[0]);
+                kZImageOutName, kZImageStateOutNames[0]);
       return StatusCode::FAILURE;
     }
     if (state[1].empty()) {
       QNN_ERROR("zimage dit: '%s' never produced by any part",
-                kZImageStateNames[1]);
+                kZImageStateOutNames[1]);
       return StatusCode::FAILURE;
     }
     return StatusCode::SUCCESS;
@@ -1069,9 +1076,9 @@ class QnnModel : public QnnSampleApp {
       QNN_ERROR("zimage dit: residual state not populated by the prior part");
       return StatusCode::FAILURE;
     }
-    if (!writeNamedFloat(graphInfo, kZImageStateNames[0], state[0].data(),
+    if (!writeNamedFloat(graphInfo, kZImageStateInNames[0], state[0].data(),
                          state[0].size()) ||
-        !writeNamedFloat(graphInfo, kZImageStateNames[1], state[1].data(),
+        !writeNamedFloat(graphInfo, kZImageStateInNames[1], state[1].data(),
                          state[1].size()) ||
         !writeZImagePositions(graphInfo, pos_ids, attn_mask, tokens))
       return StatusCode::FAILURE;
