@@ -266,6 +266,7 @@ def main():
         return
 
     from remote_safetensors import open_shards
+    from static_export import dit_input_names, dit_output_names
 
     odir = os.path.join(args.work, "onnx")
     os.makedirs(odir, exist_ok=True)
@@ -285,9 +286,19 @@ def main():
         pdir = os.path.join(odir, f"part{n}")
         os.makedirs(pdir, exist_ok=True)
         out = os.path.join(pdir, f"unet_part{n}.onnx")
+        first, last = pi == 0, pi == len(cuts) - 1
+        want_in = dit_input_names(first)
+        want_out = dit_output_names(first, last)
         if os.path.exists(out):
-            log(f"part{n} already exported, skipping")
-            manifest.append({**entry, "onnx": out})
+            # Re-check rather than trust it. Resuming is the normal way this
+            # runs, so an ONNX on disk is usually from an *earlier* version of
+            # this script -- possibly one that predates these checks, or that
+            # was interrupted mid-write. Skipping validation on exactly the
+            # files least likely to have been validated is backwards.
+            check_io_names(out, want_in, want_out)
+            log(f"part{n} already exported and still valid, skipping")
+            manifest.append({**entry, "onnx": out, "inputs": want_in,
+                             "outputs": want_out})
             continue
 
         if readers is None:
@@ -295,10 +306,14 @@ def main():
             readers, weight_map = open_shards(REPO, SUBDIR)
 
         log(f"building part{n} (blocks {a}..{b}, free {free_gb(args.work):.1f} GB)")
-        cache = os.path.join(args.work, "parts", f"part{n}.safetensors") \
+        # Cache filename carries the plan, not just the part number: part 8 of 8
+        # is blocks 27..30 while part 8 of 30 is block 7, and reusing one for the
+        # other would export the wrong weights under the right name.
+        cache = os.path.join(args.work, "parts",
+                             f"p{n}of{len(cuts)}.safetensors") \
             if args.cache_weights else None
         sd = fetch_part_weights(readers, weight_map, cuts, pi, cache=cache)
-        part = build_part(sd, b - a, first=(pi == 0), last=(pi == len(cuts) - 1))
+        part = build_part(sd, b - a, first=first, last=last)
         del sd
         gc.collect()
         log(f"  exporting -> {out}")
@@ -312,8 +327,23 @@ def main():
 
     # Written per invocation, so a --only run still records the full plan and a
     # later run can tell how many parts the device should look for.
+    # Merge rather than overwrite: convert_all.sh drives this one --only part at
+    # a time, so a plain rewrite would leave a manifest describing the last part
+    # and nothing else.
     mpath = os.path.join(args.work, "dit_manifest.json")
-    json.dump({"parts": manifest, "n_parts": len(cuts),
+    prior = {}
+    if os.path.exists(mpath):
+        try:
+            old = json.load(open(mpath))
+            if old.get("n_parts") == len(cuts):
+                prior = {p["part"]: p for p in old.get("parts", [])}
+        except (ValueError, KeyError):
+            pass
+    merged = []
+    for e in manifest:
+        was = prior.get(e["part"], {})
+        merged.append({**was, **e} if len(e) > 2 else (was or e))
+    json.dump({"parts": merged, "n_parts": len(cuts),
                "cap_slots": CAP_SLOTS, "latent": LATENT},
               open(mpath, "w"), indent=2)
     log(f"manifest -> {mpath}")

@@ -107,7 +107,11 @@ class RemoteSafetensors:
         t = torch.from_numpy(arr)
         if info["dtype"] == "BF16":
             t = t.view(torch.bfloat16)
-        return t.view(info["shape"]) if info["shape"] else t
+        # An empty shape means a 0-dim scalar, not "leave it alone": frombuffer
+        # always produces at least 1-D, so returning `t` unreshaped would hand
+        # back shape (1,) where the checkpoint says (). Neither Z-Image
+        # checkpoint contains one, but this module is not Z-Image specific.
+        return t.reshape(info["shape"])
 
     def get_tensors(self, names, dtype=None, progress=None):
         """Fetch several tensors, coalescing neighbours into single requests.
@@ -116,7 +120,15 @@ class RemoteSafetensors:
         the fp32 original before the next range lands — the whole point is to
         never hold the full part in fp32.
         """
-        names = [n for n in names if n in self.header]
+        # Asking for a name this file does not have is a bug in the caller, not
+        # something to quietly skip: the result would be a state dict missing
+        # weights, which load_state_dict reports as `missing` and which an
+        # over-permissive check then waves through as randomly-initialised.
+        names = list(names)
+        unknown = [n for n in names if n not in self.header]
+        if unknown:
+            raise KeyError(f"{len(unknown)} tensor(s) not in this file: "
+                           f"{unknown[:5]}")
         names.sort(key=lambda n: self.header[n]["data_offsets"][0])
 
         runs, cur = [], []

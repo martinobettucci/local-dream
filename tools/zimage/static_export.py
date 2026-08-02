@@ -34,6 +34,25 @@ def caption_len(true_len: int, seq_multiple: int = 32) -> int:
     return math.ceil(true_len / seq_multiple) * seq_multiple
 
 
+def dit_input_names(first):
+    """The graph IO contract, as free functions so it can be checked without
+    building a part -- the resume path has an ONNX on disk and no model.
+
+    "hidden_in", not "hidden": torch.onnx.export refuses to give a graph an
+    input and an output with the same name and silently renames the input to
+    "hidden.1", which the app -- which binds by name -- would only discover on
+    device. Matches kZImageStateInNames in QnnModel.hpp.
+    """
+    return (["sample", "timestep", "context", "pos_ids", "attn_mask", "cap_pad_mask"]
+            if first else ["hidden_in", "emb", "pos_ids", "attn_mask"])
+
+
+def dit_output_names(first, last):
+    if last:
+        return ["out_sample"]
+    return ["hidden", "emb"] if first else ["hidden"]
+
+
 def build_positions(true_len, cap_slots, grid_h, grid_w, seq_multiple=32):
     """Host-side pos_ids / attn_mask / cap_pad_mask, mirroring PipelineZImage.
 
@@ -190,12 +209,7 @@ class StaticZImageDiT(nn.Module):
     # -- export metadata ---------------------------------------------------
     @property
     def input_names(self):
-        # "hidden_in", not "hidden": torch.onnx.export refuses to give a graph an
-        # input and an output with the same name and silently renames the input
-        # to "hidden.1", which the app -- which binds by name -- would only
-        # discover on device. Matches kZImageStateInNames in QnnModel.hpp.
-        return (["sample", "timestep", "context", "pos_ids", "attn_mask", "cap_pad_mask"]
-                if self.first else ["hidden_in", "emb", "pos_ids", "attn_mask"])
+        return dit_input_names(self.first)
 
     @property
     def emb_dim(self):
@@ -217,9 +231,7 @@ class StaticZImageDiT(nn.Module):
 
     @property
     def output_names(self):
-        if self.last:
-            return ["out_sample"]
-        return ["hidden", "emb"] if self.first else ["hidden"]
+        return dit_output_names(self.first, self.last)
 
     def example_inputs(self, true_len=None, dim=None):
         """Dummy inputs of the exact exported shapes."""
