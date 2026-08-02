@@ -27,9 +27,7 @@ if [ -f "$OUT/unet_part$N.bin" ]; then say "already built, skipping"; exit 0; fi
 say "1/5 export ONNX"
 "$PY" "$SCRATCH/export_dit.py" --work "$W" --parts 8 --only "$N" 2>&1 | grep -E "^\[export_dit\]" || true
 [ -f "$ODIR/unet_part$N.onnx" ] || { echo "export produced no ONNX"; exit 1; }
-# The ONNX carries its own copy of the weights, so the fp16 source is dead now.
-rm -f "$W/parts/part$N.safetensors"
-say "2/5 fp16 source released"
+say "2/5 ONNX built"
 
 # Calibration inputs must match the graph's declared names, shapes and dtypes,
 # so they are read off the ONNX itself rather than hardcoded — and therefore
@@ -54,14 +52,27 @@ open(f"{W}/calib{N}.txt", "w").write(" ".join(parts) + "\n")
 print("  calib inputs:", " ".join(x.split(":=")[0] for x in parts))
 PY
 
+# Never pipe a stage through tail: the pipeline's exit status is tail's, so a
+# failed converter looks like success under `set -e`. Log in full, then verify
+# the artifact actually exists before deleting anything upstream of it — an
+# earlier version reported "INFO_CONVERSION_SUCCESS" while writing no DLC, and
+# had already destroyed the fp16 source by then.
 "$QNN" "$BIN/qairt-converter" --input_network "$ODIR/unet_part$N.onnx" \
-    --output_path "$W/unet_part$N.dlc" --preserve_io_datatype 2>&1 | tail -2
-rm -rf "$ODIR"
-say "3/5 DLC built, ONNX released"
+    --output_path "$W/unet_part$N.dlc" --preserve_io_datatype > "$W/convert$N.log" 2>&1 \
+    || { echo "convert FAILED:"; tail -20 "$W/convert$N.log"; exit 1; }
+if [ ! -s "$W/unet_part$N.dlc" ]; then
+    echo "converter exited 0 but produced no DLC (free $(free_gb)G) — last lines:"
+    tail -20 "$W/convert$N.log"; exit 1
+fi
+# Only now is the ONNX redundant, and only now is the fp16 source redundant.
+rm -rf "$ODIR"; rm -f "$W/parts/part$N.safetensors"
+say "3/5 DLC built, ONNX + fp16 released"
 
 "$QNN" "$BIN/qairt-quantizer" --input_dlc "$W/unet_part$N.dlc" \
     --output_dlc "$W/unet_part${N}_q.dlc" --input_list "$W/calib$N.txt" \
-    --weights_bitwidth "$WBITS" --act_bitwidth 16 --bias_bitwidth 32 2>&1 | tail -2
+    --weights_bitwidth "$WBITS" --act_bitwidth 16 --bias_bitwidth 32 \
+    > "$W/quant$N.log" 2>&1 || { echo "quantize FAILED:"; tail -20 "$W/quant$N.log"; exit 1; }
+[ -s "$W/unet_part${N}_q.dlc" ] || { echo "no quantized DLC:"; tail -20 "$W/quant$N.log"; exit 1; }
 rm -f "$W/unet_part$N.dlc"; rm -rf "$W/calib$N"
 say "4/5 quantized w${WBITS}a16, float DLC released"
 
@@ -74,6 +85,8 @@ J
 "$BIN/qnn-context-binary-generator" --dlc_path "$W/unet_part${N}_q.dlc" \
     --backend "$QNN_SDK_ROOT/lib/x86_64-linux-clang/libQnnHtp.so" \
     --config_file "$W/ext_v73.json" --output_dir "$OUT" \
-    --binary_file "unet_part$N" 2>&1 | tail -3
+    --binary_file "unet_part$N" > "$W/ctx$N.log" 2>&1 \
+    || { echo "context binary FAILED:"; tail -20 "$W/ctx$N.log"; exit 1; }
+[ -s "$OUT/unet_part$N.bin" ] || { echo "no .bin:"; tail -20 "$W/ctx$N.log"; exit 1; }
 rm -f "$W/unet_part${N}_q.dlc"
 say "5/5 done -> $(ls -la "$OUT/unet_part$N.bin" | awk '{print $5}') bytes"
