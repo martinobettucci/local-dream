@@ -110,12 +110,38 @@ limit is 512 Qwen tokens, and short prompts cost nothing in quality — the stat
 
 ## Quantization
 
-`w4a16` — 4-bit weights, 16-bit activations.
+`w4a16` — 4-bit weight *encodings*, 16-bit activations.
 
-Note that 2-bit weights are also supported by the toolchain
-(`qairt-quantizer --weights_bitwidth` accepts 2, 4, 8 or 16), so a w2a16 build
-is possible and would roughly halve the size again. It has not been built or
-measured here, and no quality comparison exists.
+### Why not 2-bit, since the toolchain accepts it
+
+`qairt-quantizer --weights_bitwidth` does accept `2`, and Hexagon v73 does
+compile the result — this was tested, not assumed. It is still pointless, and
+the measurement says why. One real DiT part (181 M parameters), one float DLC,
+quantized four ways:
+
+| build | tensor datatype | encoding `bitwidth` | DLC bytes |
+|---|---|---|---|
+| float | fp32 | — | 724,077,604 |
+| `--weights_bitwidth 8` | `uFxp_8` | 8 | 181,246,372 |
+| `--weights_bitwidth 4` | `uFxp_8` | 4 | 181,246,412 |
+| `--weights_bitwidth 2` | `uFxp_8` | 2 | 181,246,412 |
+| `4 --pack_4_bit_weights` | `uFxp_4` | 4 | 90,806,732 — **HTP rejects** |
+
+**w2 and w4 are byte-identical.** `--weights_bitwidth` sets a metadata field on
+the encoding, not the storage; `QnnTypes.h` says data quantized below its
+datatype's width "will still occupy the full extent of bits allotted to the
+tensor ... in unpacked form". So asking for 2 bits discards three quarters of
+the quantization levels and writes exactly as many bytes.
+
+`--pack_4_bit_weights` genuinely halves it — and then
+`qnn-context-binary-generator` refuses the graph, because across all three
+activation configurations the weight datatypes `FullyConnected` accepts on v73
+are only `FLOAT_16/32`, `SFIXED_POINT_8/16` and `UFIXED_POINT_8/16`. **There is
+no 4-bit weight datatype on this hardware.**
+
+So every runnable weight width is the same size, and w4 is chosen over w8 only
+for the VTCM-traffic benefit the HTP documents for int4 encodings — not for
+bytes. If quality turns out to be the binding problem, w8 costs nothing extra.
 
 ## Conversion
 
