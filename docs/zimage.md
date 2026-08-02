@@ -764,3 +764,39 @@ unmasked control, i.e. summation-order noise rather than a behaviour change.
 Worth internalising: **a graph that quantizes is not a graph that compiles.**
 Op-support failures surface only at context-binary generation, which is also the
 slowest stage. Build one part end to end before starting the other 29.
+
+### Text encoder export, measured
+
+`tools/zimage/export_clip.py` builds the chain; `verify_clip_chunk.py` checks it
+on a tiny random Qwen3 in seconds and is worth re-running after any transformers
+bump. It reports **0.0 max abs difference** against
+`hidden_states[-2]` at 1, 2, 3 and 5 parts — with a deliberate control that runs
+all N layers instead of N-1 and differs by 7.1e-02, because without that control
+the check would pass just as happily with an off-by-one in `usable_layers()`.
+
+First real export, 3 of the 35 layers: **1.21 GB** of ONNX, inputs
+`input_embedding` / `attention_mask`, output `hidden` — names intact, no
+rename. Op scan comes back clean:
+
+```
+Constant 146, Mul 51, Cast 30, Add 27, MatMul 27, Reshape 19, Transpose 15,
+Pow 12, ReduceMean 12, Sqrt 12, Div 12, Slice 12, Where 7, Neg 6, Concat 6,
+Unsqueeze 6, ConstantOfShape 6, Equal 6, Expand 6, Softmax 3, Sigmoid 3,
+Greater 1, And 1
+```
+
+No `IsNaN`, unlike the DiT's first attempt. The difference is the mask: the
+chunk builds an **additive float** mask from `attention_mask` inside the graph
+(0 / -1e4), and SDPA given a float mask has no fully-masked-row case to guard,
+so nothing needs an `IsNaN`. Rotary tables are baked in as constants — the app
+always right-pads to 512, so positions are compile-time known and only the mask
+varies with the prompt.
+
+The graph IO contract mirrors the DiT's, including `hidden_in` on later parts
+for the same ONNX naming reason:
+
+| part | in | out |
+|---|---|---|
+| 1 | `input_embedding` `[1,512,2560]`, `attention_mask` `[1,512]` | `hidden` |
+| middle | `hidden_in`, `attention_mask` | `hidden` |
+| last | `hidden_in`, `attention_mask` | `context` `[1,512,2560]` |
