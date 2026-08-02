@@ -35,37 +35,35 @@ inversion (Qwen3's embedding space is not CLIP's), and LoRA.
 
 ## 2. About "Q2"
 
-Short version: **there is no 2-bit path on the NPU, and the CPU path that does
-have one is far too slow to use.** The practical target is `w4a16` on the HTP.
+**Correction: 2-bit weights ARE supported.** An earlier version of this
+document said the HTP had no 2-bit weight format and that a "Q2" build was
+impossible. That was wrong. `qairt-quantizer --weights_bitwidth` documents its
+accepted values as "either 2, 4, 8 (default) or 16", so w2a16 converts. What is
+still unverified is whether the HTP executes it acceptably and what the quality
+cost is — neither has been measured here.
 
-**NPU (QNN/HTP).** The HTP quantizer supports 8/16-bit activations and 4/8-bit
-weights. There is no 2-bit weight format, so a "Z-Image Q2" NPU export is not
-something that can be built today regardless of how the graph is cut. The floor
-is 4-bit weights:
+Sizes at each width, DiT plus Qwen3-4B body:
 
-| Component | Params | `w8a16` | `w4a16` |
-|---|---|---|---|
-| S3-DiT | ~6.0 B | ~6.0 GB | ~3.0 GB |
-| Qwen3-4B body (embedding excluded, see below) | ~3.6 B | ~3.6 GB | ~1.8 GB |
-| Flux VAE (enc + dec) | ~0.08 B | ~0.16 GB | — |
+| Component | Params | `w8a16` | `w4a16` | `w2a16` |
+|---|---|---|---|---|
+| S3-DiT | ~6.0 B | ~6.0 GB | ~3.0 GB | ~1.5 GB |
+| Qwen3-4B body (embedding excluded) | ~3.6 B | ~3.6 GB | ~1.8 GB | ~0.9 GB |
+| Flux VAE (enc + dec) | ~0.08 B | ~0.16 GB | — | — |
 
-Plus `token_emb.bin`: 151936 × 2560 fp16 ≈ **778 MB**, kept out of the graph and
-mmap'd (the token lookup runs on the CPU, as it does for Anima).
+Plus `token_emb.bin`: 151936 x 2560 fp16 = **778 MB**, kept out of the graph and
+mmap'd (the token lookup runs on CPU, as it does for Anima). At w4a16 the whole
+model is roughly 5.5-6 GB; at w2a16 nearer 3.5 GB.
 
-So a `w4a16` model is roughly **5.5–6 GB on disk**. Nothing holds all of it at
-once — the pipeline loads one stage at a time under `--lowram`, and
-`--anima_seq_dit` drops the peak further to a single DiT part.
+**Bit width does not change the conversion's memory cost.** `qairt-quantizer`
+runs the graph to collect activation statistics regardless of the weight width,
+so w2, w4 and w8 all need the same RAM. `--enable_float_fallback
+--float_bitwidth 16` is the only mode that skips calibration (and it forbids
+`--input_list`), but it produces fp16 — ~12 GB for the DiT, which defeats the
+point.
 
-**CPU (MNN).** MNN's `--weightQuantBits` does go down to 2, so a genuine Q2
-build is possible there — and it still isn't usable. One DiT step is
-~2 × 6e9 × 4608 tokens ≈ **55 TFLOP**; a phone CPU delivering tens of GFLOPS
-needs on the order of ten minutes *per step*, so eight steps is hours. That is
-why this format is NPU-only. (For scale: the same step on an HTP doing tens of
-T-MAC/s lands in the seconds, which is what makes 8-step Turbo viable at all.)
-
-If you want a smaller file, the lever that actually exists is mixed precision —
-keep the first/last blocks and the modulation paths at 8-bit and push the bulk
-of the attention/FFN weights to 4-bit — not a lower uniform bit width.
+**CPU (MNN).** MNN's `--weightQuantBits` also goes down to 2, and it still is
+not usable: one DiT step is ~2 x 6e9 x 4608 tokens = **55 TFLOP**, which is
+minutes per step on a phone CPU. This format is NPU-only.
 
 ---
 

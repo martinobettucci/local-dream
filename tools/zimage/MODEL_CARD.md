@@ -93,9 +93,12 @@ limit is 512 Qwen tokens, and short prompts cost nothing in quality — the stat
 
 ## Quantization
 
-`w4a16` — 4-bit weights, 16-bit activations. This is the floor on Hexagon: the
-HTP quantizer has no 2-bit weight format, so a "Q2" build is not possible today
-regardless of how the graph is cut.
+`w4a16` — 4-bit weights, 16-bit activations.
+
+Note that 2-bit weights are also supported by the toolchain
+(`qairt-quantizer --weights_bitwidth` accepts 2, 4, 8 or 16), so a w2a16 build
+is possible and would roughly halve the size again. It has not been built or
+measured here, and no quality comparison exists.
 
 ## Conversion
 
