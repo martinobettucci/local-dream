@@ -214,6 +214,28 @@ def check_io_names(path, want_in, want_out):
             f"          got    {got_in}\n"
             f"  outputs wanted {list(want_out)}\n"
             f"          got    {got_out}")
+    check_htp_ops(m)
+
+
+# Ops the HTP backend has no implementation for, which qnn-context-binary-generator
+# only rejects at the very last stage -- after convert and quantize have both
+# spent several minutes succeeding. IsNan is the one that actually bit:
+# F.scaled_dot_product_attention with a boolean mask emits it to guard rows
+# where every key is masked. The rest are here because they arrive by the same
+# route (a decomposition nobody asked for) and would fail the same way.
+UNSUPPORTED_OPS = {"IsNaN", "IsInf", "NonZero", "Loop", "If", "Scan",
+                   "SequenceAt", "GatherND", "Unique"}
+
+
+def check_htp_ops(model):
+    bad = sorted({n.op_type for n in model.graph.node} & UNSUPPORTED_OPS)
+    if bad:
+        raise RuntimeError(
+            f"graph contains ops the HTP cannot run: {bad}\n"
+            f"  qnn-context-binary-generator would reject this after convert and "
+            f"quantize both succeed, which costs minutes per part. IsNaN usually "
+            f"means F.scaled_dot_product_attention with a boolean mask -- use an "
+            f"additive float mask and write the attention out.")
 
 
 def main():
