@@ -6,7 +6,7 @@
     <string name="anythingv5_description">Anime Image Generation</string>
     <string name="cyberrealistic_description">Realistic Image Generation</string>
     <string name="illustriousv16_description">WAI Illustrious SDXL v16</string>
-    <string name="zimage_turbo_description">6B DiT、8ステップ、自然言語プロンプト</string>
+    <string name="zimage_turbo_description">6B DiT、8ステップ · 8 Gen 3+ と16GBメモリが必要</string>
     <string name="dmd2_description">DMD2 LoRAをマージ</string>
     <string name="capture_logs">ログを収集</string>
     <string name="capture_logs_hint">モデル実行中にアプリのログを収集し、終了後に表示します</string>
@@ -76,7 +76,7 @@
     <string name="got_it">わかった</string>
     <string name="yes">はい</string>
     <string name="about_app">重要</string>
-    <string name="must_read">このアプリは、CPU/GPU および一部の Qualcomm 製 NPU 上で Stable Diffusion による画像生成を実行できます。\n\nSD1.5 モデルは、Hexagon V68 アーキテクチャ以降の Snapdragon NPU で動作します。\n\nSDXL モデルは、Snapdragon 8 Gen 3 以降のデバイスで動作します。\n\n上記に該当しないチップでは、CPU/GPU のみでの実行となります。\n\nこのプロジェクトはオープンソースで、\nhttps://github.com/xororz/local-dream\nにてソースコードの閲覧や Issue の報告ができます。\n\nドキュメント：https://ld.chino.icu</string>
+    <string name="must_read">このアプリは、CPU/GPU および一部の Qualcomm 製 NPU 上で Stable Diffusion による画像生成を実行できます。\n\nSD1.5 モデルは、Hexagon V68 アーキテクチャ以降の Snapdragon NPU で動作します。\n\nSDXL モデルは、Snapdragon 8 Gen 3 以降のデバイスで動作します。\n\nZ-Image Turbo は、Snapdragon 8 Gen 3 以降かつ 16GB メモリのデバイスで動作します。重みは別途ダウンロードが必要で、現在実機未検証です。\n\n上記に該当しないチップでは、CPU/GPU のみでの実行となります。\n\nこのプロジェクトはオープンソースで、\nhttps://github.com/xororz/local-dream\nにてソースコードの閲覧や Issue の報告ができます。\n\nドキュメント：https://ld.chino.icu</string>
     <string name="help">ヘルプ</string>
     <string name="more_options">その他</string>
 

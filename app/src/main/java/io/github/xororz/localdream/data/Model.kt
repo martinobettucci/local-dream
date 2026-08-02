@@ -578,11 +578,21 @@ class ModelRepository private constructor(private val context: Context) {
 
     // Z-Image asks for more than any other format here: a 6B DiT plus a 4B text
     // encoder, ~5.8GB of w4a16 weights streamed through the HTP a stage at a
-    // time. The SoC gate is SDXL's (8 Gen 3 and newer), but SoC alone says
-    // nothing about RAM, and below ~12GB the model cannot be run even with
-    // sequential DiT loading — so a device that would only ever fail is not
-    // shown a 5.8GB download.
-    private fun isZImageCapableDevice(): Boolean = isSdxlCapableSoc(getDeviceSoc()) && deviceTotalRamGb() >= 11
+    // time. It really wants an 8 Gen 3 class part and 16GB of RAM.
+    //
+    // Those are stated in the model's description rather than used to hide it.
+    // An earlier version gated on isSdxlCapableSoc() && RAM >= 11, which made
+    // the entry invisible on anything outside six hardcoded SOC_MODEL strings —
+    // including devices that could run it, and including every device whose
+    // owner wanted to find out. A listing that says what it needs beats one the
+    // user cannot see; the download is theirs to start.
+    private fun isZImageCapableDevice(): Boolean {
+        val soc = getDeviceSoc()
+        val ram = deviceTotalRamGb()
+        val supported = Model.isDeviceSupported()
+        Log.i("ModelRepository", "zimage listing: soc=$soc ram=${ram}GB npuSupported=$supported")
+        return supported
+    }
 
     // Rounded down; a nominally 12GB device reports slightly less than 12.
     private fun deviceTotalRamGb(): Long {
