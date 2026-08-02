@@ -68,6 +68,23 @@ Z-Image.
 Download and unzip into the app's model directory, or use the in-app download.
 The archive unpacks to the model directory root — not into a subfolder.
 
+## `partial/` — conversion in progress
+
+`partial/` holds pieces that have been converted but do not yet add up to a
+runnable model. **It is not installable.** Each file is uploaded the moment it
+is built, because the conversion runs on ephemeral machines with less free disk
+than the finished model needs — publishing every piece immediately is what stops
+a reclaimed container from costing the whole run.
+
+`partial/stats/partN.tsv` records peak RSS and wall clock per stage
+(`stage`, `peak_rss_kb`, `seconds`, `exit_code`) for the machine that built each
+part. That is what the split count is chosen from: `qairt-quantizer` holds a
+whole part plus a calibration sample's activations, and fewer blocks per part is
+the only lever on it.
+
+When `partial/` is complete it is repackaged as the archive above and this
+section goes away.
+
 ## What is in the archive
 
 | File | What it is |
