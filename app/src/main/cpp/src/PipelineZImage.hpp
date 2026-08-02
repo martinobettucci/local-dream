@@ -31,8 +31,9 @@
 //       16 latent channels, 8x downsample.
 //
 // Differences from the Anima DiT that shares this base class:
-//   * single-stream. Text and image tokens occupy ONE residual sequence, so
-//     the caption is folded into `hidden` by part 1 and never re-supplied.
+//   * single-stream. Image and caption tokens occupy ONE residual sequence,
+//     in that order, so the caption is folded into `hidden` by part 1 and
+//     never re-supplied.
 //     What every part does take is the per-token RoPE coordinates and the
 //     attention mask: the reference drops padded caption rows, so the caption
 //     length — and with it every image token's t coordinate — varies per
@@ -245,39 +246,35 @@ class PipelineZImage : public PipelineQnn {
   }
   int totalTokens() const { return zimage_text_seq_len + imageTokens(); }
 
-  // Builds the 3D RoPE coordinates and attention mask for one prompt side.
+  // Builds the 3D RoPE coordinates and the two masks for one prompt side.
   //
-  // This has to mirror the reference pipeline exactly, and the subtle part is
-  // that it is length-dependent. Z-Image drops padded caption rows before the
-  // DiT sees them, pads what is left up to a multiple of SEQ_MULTI_OF, and then
-  // positions the image tokens at cap_len + 1. So the caption's real length
-  // shifts every image token's t coordinate. A static graph keeps 512 caption
-  // slots regardless, which is why the coordinates are computed here per prompt
-  // and fed in rather than baked into the graph — pinning them as though the
-  // caption were always 512 long measurably changes the output.
+  // Verified bit-exact against the reference pipeline (see docs/zimage.md §9).
+  // Three things have to line up, and all three are easy to get wrong:
+  //
+  //  * ORDER. Basic mode concatenates [image, caption] — image tokens first.
+  //  * cap_len = round-up(true_len, 32) is where the reference stops. Slots
+  //    beyond it never exist there, so they must be masked OUT of attention.
+  //    Slots between true_len and cap_len DO exist there (as a learned pad
+  //    token) and must stay IN.
+  //  * image tokens sit at t = cap_len + 1, so their RoPE coordinate moves
+  //    with the prompt length. That is why none of this can be baked in.
   void buildPositions(const float *mask, std::vector<int32_t> &pos_ids,
-                      std::vector<float> &attn_mask) const {
+                      std::vector<float> &attn_mask,
+                      std::vector<float> &cap_pad_mask) const {
     int true_len = 0;
     for (int i = 0; i < zimage_text_seq_len; ++i)
       if (mask[i] > 0.5f) ++true_len;
-    // Round up to the sequence multiple, exactly as _pad_with_ids does.
     int cap_len = ((true_len + zimage_seq_multiple - 1) / zimage_seq_multiple) *
                   zimage_seq_multiple;
     if (cap_len > zimage_text_seq_len) cap_len = zimage_text_seq_len;
 
+    const int img = imageTokens();
     const int tokens = totalTokens();
     pos_ids.assign((size_t)tokens * zimage_rope_axes, 0);
     attn_mask.assign(tokens, 0.0f);
+    cap_pad_mask.assign(zimage_text_seq_len, 0.0f);
 
-    // Caption block: t = 1..cap_len over the occupied slots, (0,0,0) beyond.
-    // Only the genuinely real rows are attended to.
-    for (int i = 0; i < zimage_text_seq_len; ++i) {
-      const size_t o = (size_t)i * zimage_rope_axes;
-      if (i < cap_len) pos_ids[o] = i + 1;
-      attn_mask[i] = (i < true_len) ? 1.0f : 0.0f;
-    }
-
-    // Image block: a single t plane at cap_len + 1, indexed by (h, w).
+    // Image block first: one t plane at cap_len + 1, indexed by (h, w).
     const int grid_h = sample_height / zimage_patch_size;
     const int grid_w = sample_width / zimage_patch_size;
     const int t_img = cap_len + 1;
@@ -286,7 +283,7 @@ class PipelineZImage : public PipelineQnn {
                t_img, zimage_rope_axis_len_t);
     for (int r = 0; r < grid_h; ++r) {
       for (int c = 0; c < grid_w; ++c) {
-        const int tok = zimage_text_seq_len + r * grid_w + c;
+        const int tok = r * grid_w + c;
         const size_t o = (size_t)tok * zimage_rope_axes;
         pos_ids[o + 0] = t_img;
         pos_ids[o + 1] = r;
@@ -294,87 +291,18 @@ class PipelineZImage : public PipelineQnn {
         attn_mask[tok] = 1.0f;
       }
     }
-  }
 
-  void endDenoise() override {
-    if (!lowram_) return;
-    releaseDitParts();
-  }
-
-  void vaeDecode(const GenerationRequest &, const float *latents,
-                 float *pixels) override {
-    if (lowram_ && !vae_decoder_) {
-      vae_decoder_ =
-          qnn_runtime::createAndInitModel(vae_decoder_path_, "vae_decoder");
-      QNN_INFO("[lowram] Z-Image VAE decoder loaded");
+    // Caption block: t = 1..cap_len over the slots the reference would have
+    // created, (0,0,0) and masked off beyond.
+    for (int i = 0; i < zimage_text_seq_len; ++i) {
+      const int tok = img + i;
+      if (i < cap_len) {
+        pos_ids[(size_t)tok * zimage_rope_axes] = i + 1;
+        attn_mask[tok] = 1.0f;
+      }
+      // Rows past the real prompt are replaced by the DiT's learned pad token.
+      cap_pad_mask[i] = (i >= true_len) ? 1.0f : 0.0f;
     }
-    if (!vae_decoder_) throw std::runtime_error("Z-Image VAE decoder missing");
-    if (StatusCode::SUCCESS !=
-        vae_decoder_->executeZImageVaeDecoder(latents, pixels))
-      throw std::runtime_error("Z-Image VAE decode failed");
-    // Stays loaded for the rest of the decode stage; released by
-    // releaseTransientModels() when generate() exits.
-  }
-
-  // Catch-all for lowram: release whatever stage model is still loaded when
-  // generate() exits (normal return or exception).
-  void releaseTransientModels() override {
-    if (!lowram_) return;
-    releaseClip();
-    releaseDitParts();
-    if (vae_decoder_) {
-      vae_decoder_.reset();
-      QNN_INFO("[lowram] Z-Image VAE decoder released");
-    }
-    releaseVaeEncoder();
-  }
-
- private:
-  // One full pass of the DiT for a single CFG branch: part 1 folds the caption
-  // and the noised latent into the residual stream, each later part advances
-  // it, and the terminal part emits the flow velocity. `mask` is the caption
-  // attention mask, needed by every part because the pad count is
-  // prompt-dependent and so cannot live inside the graph.
-  void runDitChain(const float *sample, float timestep, const float *context,
-                   const float *mask, float *out) {
-    if (!mask) throw std::runtime_error("Z-Image conditioning has no mask");
-    buildPositions(mask, pos_ids_, attn_mask_);
-    const size_t tokens = (size_t)totalTokens();
-
-    const size_t n = dit_part_paths_.size();
-    for (size_t i = 0; i < n; ++i) {
-      if (seq_dit_) loadDitPartAlone(i);
-      QnnModel *part = dit_parts_[i].get();
-      if (!part)
-        throw std::runtime_error("Z-Image DiT part " + std::to_string(i + 1) +
-                                 " not loaded");
-
-      // Only the part that actually declares `out_sample` may write the
-      // velocity; asking a mid-chain part for it would silently truncate the
-      // stream, so the buffer is handed over solely to the terminal part.
-      const bool terminal = part->zimageGraphIsTerminal();
-      if (terminal && i + 1 != n)
-        QNN_WARN("zimage: DiT part %zu is terminal but %zu parts were found; "
-                 "the remaining parts will not run",
-                 i + 1, n);
-
-      StatusCode st =
-          (i == 0) ? part->executeZImageDitFirst(
-                         sample, timestep, context, pos_ids_.data(),
-                         attn_mask_.data(), tokens, dit_state_,
-                         terminal ? out : nullptr)
-                   : part->executeZImageDitNext(dit_state_, pos_ids_.data(),
-                                                attn_mask_.data(), tokens,
-                                                terminal ? out : nullptr);
-      if (seq_dit_) releaseDitPart(i);
-      if (st != StatusCode::SUCCESS)
-        throw std::runtime_error("Z-Image DiT part " + std::to_string(i + 1) +
-                                 " failed");
-      if (terminal) return;
-    }
-    throw std::runtime_error(
-        "Z-Image DiT chain ended without a terminal part (no graph exposes an "
-        "'out_sample' output)");
   }
 
   void runTextEncoder(const std::vector<float> &input_embedding,
@@ -506,6 +434,8 @@ class PipelineZImage : public PipelineQnn {
   // reused across steps and parts.
   std::vector<int32_t> pos_ids_;
   std::vector<float> attn_mask_;
+  // Only part 1 embeds the caption, so only it needs the pad-token mask.
+  std::vector<float> cap_pad_mask_;
 };
 
 #endif  // PIPELINEZIMAGE_HPP

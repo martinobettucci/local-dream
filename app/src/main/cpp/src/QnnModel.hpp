@@ -915,14 +915,20 @@ class QnnModel : public QnnSampleApp {
   // re-supply past the first part — the caption tokens are already inside
   // `hidden`. Two things do have to reach every part:
   //
+  // The unified sequence is ordered [image tokens, caption slots] — image
+  // FIRST, which is what diffusers' basic mode does.
+  //
   //   pos_ids   3D RoPE coordinates (t, h, w) per token. These CANNOT be baked
-  //             into the graph. The reference pipeline drops padded caption
-  //             rows before the DiT sees them, so the caption length varies
-  //             per prompt, and image tokens sit at cap_len + 1 — so every
-  //             image token's t coordinate moves with the prompt.
-  //             Fixing them (as if the caption were always 512 long) measurably
-  //             changes the output; see docs/zimage.md section 9.
-  //   attn_mask 1 for a real token, 0 for a padded caption slot.
+  //             into the graph: the reference drops padded caption rows, so the
+  //             caption length varies per prompt and image tokens sit at
+  //             cap_len + 1, moving every image token's t with the prompt.
+  //   attn_mask 1 for tokens the reference would have created, 0 beyond. The
+  //             graph MUST apply this in two places — the caption refiner and
+  //             the main blocks. With both, a fixed 512-slot caption is
+  //             bit-exact against the reference; with only the main blocks it
+  //             is not (docs/zimage.md section 9).
+  //   cap_pad_mask (part 1 only) 1 where a caption row must be replaced by the
+  //             DiT's learned pad token, i.e. past the real prompt.
   //
   // `emb` (the timestep adaLN vector) is computed once by part 1 and reused by
   // every block, so later parts take it directly and never see `timestep`.
@@ -930,8 +936,8 @@ class QnnModel : public QnnSampleApp {
   // 6B parameters do not fit a single HTP context at any supported weight
   // width, so the DiT is exported as N pieces cut between transformer blocks.
   // The chain is uniform and N is discovered on disk, not fixed here:
-  //   part 1    : (sample, timestep, context, pos_ids, attn_mask)
-  //                                                     -> (hidden, emb)
+  //   part 1    : (sample, timestep, context, pos_ids, attn_mask,
+  //                cap_pad_mask)                        -> (hidden, emb)
   //   part 1<k<N: (hidden, emb, pos_ids, attn_mask)      -> (hidden)
   //   part N    : (hidden, emb, pos_ids, attn_mask)      -> (out_sample)
   // A part is recognised as terminal purely by exposing an output named
@@ -1024,7 +1030,8 @@ class QnnModel : public QnnSampleApp {
   StatusCode executeZImageDitFirst(const float *sample, float timestep,
                                    const float *context,
                                    const int32_t *pos_ids,
-                                   const float *attn_mask, size_t tokens,
+                                   const float *attn_mask,
+                                   const float *cap_pad_mask, size_t tokens,
                                    std::vector<std::vector<float>> &state,
                                    float *out_sample) {
     if (!ensureIoTensors()) return StatusCode::FAILURE;
@@ -1038,6 +1045,8 @@ class QnnModel : public QnnSampleApp {
     if (!writeNamedFloat(graphInfo, "sample", sample, latent_elems) ||
         !writeNamedFloat(graphInfo, "timestep", &timestep, 1) ||
         !writeNamedFloat(graphInfo, "context", context, ctx_elems) ||
+        !writeNamedFloat(graphInfo, "cap_pad_mask", cap_pad_mask,
+                         zimage_text_seq_len) ||
         !writeZImagePositions(graphInfo, pos_ids, attn_mask, tokens))
       return StatusCode::FAILURE;
 

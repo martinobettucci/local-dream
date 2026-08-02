@@ -152,8 +152,10 @@ length.
 
 The DiT is cut between transformer blocks. The chain is uniform:
 
-`T` is the unified sequence length: `S` caption slots followed by
-`(H/2)·(W/2)` image tokens — 512 + 4096 = 4608 at 1024x1024.
+`T` is the unified sequence length: `(H/2)·(W/2)` **image tokens first**,
+then `S` caption slots — 4096 + 512 = 4608 at 1024x1024. The order is image
+then caption; diffusers' basic mode builds `[x, cap]`, and getting this
+backwards is silent.
 
 **Part 1**
 
@@ -163,8 +165,9 @@ The DiT is cut between transformer blocks. The chain is uniform:
 | in | `timestep` | `[1]` — this is `sigma * 1000`, not sigma |
 | in | `context` | `[1, S, D]` |
 | in | `pos_ids` | `[1, T, 3]` int32 — 3D RoPE coordinates `(t, h, w)` |
-| in | `attn_mask` | `[1, T]` — 1 real token, 0 padded caption slot |
-| out | `hidden` | `[1, T, 3840]` — the fused caption+image token stream |
+| in | `attn_mask` | `[1, T]` — 1 up to `cap_len`, 0 beyond |
+| in | `cap_pad_mask` | `[1, S]` — 1 where a caption row becomes the pad token |
+| out | `hidden` | `[1, T, 3840]` — the fused image+caption token stream |
 | out | `emb` | `[1, 3840]` — the timestep modulation vector |
 
 **Every later part**
@@ -178,14 +181,33 @@ The DiT is cut between transformer blocks. The chain is uniform:
 | out | `hidden` | `[1, T, 3840]` (non-terminal parts) |
 | out | `out_sample` | `[1, C, H, W]` (terminal part only) |
 
-`pos_ids` is an input, not a constant, and this is the one part of the contract
-most likely to be "simplified" by mistake. The reference pipeline drops padded
-caption rows before the DiT sees them, so the caption length varies per prompt,
-and image tokens are positioned at `cap_len + 1` — every image token's `t`
-coordinate therefore moves with the prompt. Baking the coordinates in as though
-the caption were always 512 long measurably changes the output (§9). The RoPE
+**The two masks are the whole ballgame.** A static graph fixes the caption at
+`S = 512` slots; the reference feeds a variable-length caption padded only to a
+multiple of 32. They agree **bit-exactly** anyway — but only if the graph
+applies `attn_mask` in *both* of the places the reference gets away without one:
+
+1. the caption refiner (`context_refiner` self-attention), and
+2. the main transformer blocks.
+
+Apply it only in (2) and a 12-token prompt lands ~3.6 % off; apply it in
+neither and it is ~16 % off (§9). The reference never needs a mask because at
+batch 1 every sequence is the same length, so `_prepare_sequence` and
+`_build_unified_sequence` both return `attn_mask = None` — it is an omission
+you must not copy.
+
+`cap_len = round-up(true_len, 32)`. Slots between `true_len` and `cap_len` are
+*real* in the reference — they hold a learned pad token — so they stay inside
+`attn_mask`; `cap_pad_mask` is what tells the graph to substitute the pad token
+there. Slots past `cap_len` do not exist in the reference and must be masked
+out.
+
+`pos_ids` is likewise an input, not a constant: image tokens are positioned at
+`cap_len + 1`, so their `t` coordinate moves with the prompt. The RoPE
 frequency tables themselves are fixed and should be baked in as initializers,
-indexed by `pos_ids`.
+gathered by `pos_ids`.
+
+Because this is exact, **there is no prompt-length limit beyond `S`** — 512
+Qwen tokens, with no quality penalty for short prompts.
 
 Later parts take no `timestep`: `emb` already is the timestep's adaLN vector,
 computed once by part 1 and reused by every block.
@@ -404,6 +426,31 @@ shards, plus 8.05 GB for the Qwen3-4B text encoder and 0.17 GB for the VAE —
 33 GB before any ONNX intermediate. Converting on a 30 GB volume means
 downloading shard by shard, casting to fp16, writing out per-part weights and
 deleting each shard as you go.
+
+**A fixed 512-slot caption is exact, if you mask correctly.**
+`tools/zimage/verify_static_equivalence.py` checks this on a tiny random-weight
+model in seconds. Masking the caption refiner *and* the main blocks past
+`cap_len`:
+
+| prompt | mean relative difference vs. reference |
+|---|---|
+| 12 tok | 0.0000 % (max abs 0.0) |
+| 40 tok | 0.0000 % (max abs 0.0) |
+| 100 tok | 0.0000 % (max abs 0.0) |
+| 300 tok | 0.0000 % (max abs 7.2e-07) |
+
+Getting there took two wrong turns worth recording, since both look correct:
+
+*Masking neither* (the obvious reading of the reference, which passes
+`attn_mask = None` at batch 1) leaves the pad slots as full participants in
+attention: 15.6 % mean relative error at 12 tokens, 4.3 % at 300 — the error
+scales with the number of pad slots. Note `pad_len = (-ori_len) % 32`, so the
+reference never has more than **31** pad tokens; a 512-slot graph would hand
+the model ~480 of them, far outside anything it was trained on.
+
+*Masking only the main blocks* still leaves the caption refiner self-attending
+over all 512 slots before the unified sequence is built, which contaminates the
+real caption rows: 3.6 % at 12 tokens.
 
 **Caption length changes the image, so positions must be inputs.** The
 reference keeps only unmasked caption rows (`prompt_embeds[i][prompt_masks[i]]`),
