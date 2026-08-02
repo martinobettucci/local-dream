@@ -543,6 +543,36 @@ own `isSdxlCapableSoc()` list starts at 8 Gen 3, so an 8 Gen 2 never sees the
 built-in SDXL cards either — it can still run imported custom NPU models, which
 is why a device can "run SDXL" while showing none of the built-in SDXL entries.
 
+**The full toolchain is proven, and it is fast.** Measured on the VAE decoder
+(4 CPU cores, no GPU), targeting Hexagon v73:
+
+| stage | time | output |
+|---|---|---|
+| `qairt-converter --preserve_io_datatype` | 9.5 s | DLC |
+| `qairt-quantizer --weights_bitwidth 8 --act_bitwidth 16 --bias_bitwidth 32 --input_list <calib>` | 37.8 s | quantized DLC |
+| `qnn-context-binary-generator --dlc_path <q.dlc> --backend libQnnHtp.so --config_file <ext.json>` | 11.9 s | 54 MB `.bin` |
+
+Selecting the Hexagon version takes two nested JSON files — the generator takes
+a backend-extensions wrapper, which points at the HTP config that actually
+carries `dsp_arch`:
+
+```json
+// ext_v73.json  (passed as --config_file)
+{"backend_extensions":{"shared_library_path":"libQnnHtpNetRunExtensions.so",
+                       "config_file_path":"/abs/path/htp_v73.json"}}
+// htp_v73.json
+{"devices":[{"dsp_arch":"v73","cores":[{"core_id":0,"perf_profile":"burst",
+                                        "rpc_control_latency":100}]}]}
+```
+
+The calibration `--input_list` is a text file with one line per sample, each
+line `input_name:=/abs/path/sample.raw`, the raw being a bare fp32 dump of the
+input tensor.
+
+Useful side effect: the generator prints a DDR bandwidth summary including
+`spill_bytes`, which is exactly the number `LOCALDREAM_ZIMAGE_SPILL_FILL_BYTES`
+wants. The VAE decoder reported `spill_bytes=436371456`.
+
 **Validation.** None of this can be checked without a Snapdragon device. A
 converted model that loads and produces an image still needs comparing against
 the reference pipeline before it is worth publishing.
