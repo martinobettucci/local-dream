@@ -25,23 +25,23 @@ import sys
 DEFAULT_REPO = "P2Enjoy/z-image-turbo-qnn"
 DEST = "model"
 
-# Where each piece lands during conversion, and what it is called in the model
-# directory. The DiT and encoder part counts are properties of the conversion,
-# so they are discovered from the repo listing rather than fixed here.
-SOURCES = [
-    ("partial/n{dit}/unet_part{i}.bin", "unet_part{i}.bin"),
-    ("partial/clip_m{clip}/clip_part{i}.bin", "clip_part{i}.bin"),
-]
+def collect(files, prefix, stem, expected, label):
+    """Parts 1..expected under `prefix`, or a report of exactly which are absent.
 
-
-def discover(files, prefix, stem):
-    """Part files under `prefix`, numbered from 1, stopping at the first gap."""
-    found = []
-    i = 1
-    while f"{prefix}/{stem}{i}.bin" in files:
-        found.append(f"{prefix}/{stem}{i}.bin")
-        i += 1
-    return found
+    Deliberately not "scan upward until a gap": the conversion builds part 1
+    last (it carries both refiner stacks, so it wants the machine to itself),
+    which means a gap-stopping scan reports zero parts for the entire run and
+    says nothing useful about what is left.
+    """
+    want = [f"{prefix}/{stem}{i}.bin" for i in range(1, expected + 1)]
+    missing = [w for w in want if w not in files]
+    if missing:
+        short = ", ".join(m.rsplit("/", 1)[1] for m in missing[:8])
+        more = f" (+{len(missing) - 8} more)" if len(missing) > 8 else ""
+        raise SystemExit(
+            f"{label} incomplete: {len(missing)} of {expected} missing "
+            f"from {prefix} -- {short}{more}")
+    return want
 
 
 def main():
@@ -76,23 +76,15 @@ def main():
         raise SystemExit(f"several encoder splits present ({clip_dirs})")
 
     dit_prefix = f"partial/{dit_dirs[0]}"
-    dit_parts = discover(names, dit_prefix, "unet_part")
-    expected = int(dit_dirs[0][1:])
-    if len(dit_parts) != expected:
-        raise SystemExit(
-            f"{dit_prefix} holds {len(dit_parts)} DiT parts but its name says "
-            f"{expected}; the conversion is incomplete")
+    dit_parts = collect(names, dit_prefix, "unet_part",
+                        int(dit_dirs[0][1:]), "DiT")
 
     plan = [(src, src.rsplit("/", 1)[1]) for src in dit_parts]
 
     if clip_dirs:
         clip_prefix = f"partial/{clip_dirs[0]}"
-        clip_parts = discover(names, clip_prefix, "clip_part")
-        expected_clip = int(clip_dirs[0].split("_m")[1])
-        if len(clip_parts) != expected_clip:
-            raise SystemExit(
-                f"{clip_prefix} holds {len(clip_parts)} encoder parts but its "
-                f"name says {expected_clip}; the conversion is incomplete")
+        clip_parts = collect(names, clip_prefix, "clip_part",
+                             int(clip_dirs[0].split("_m")[1]), "text encoder")
         plan += [(src, src.rsplit("/", 1)[1]) for src in clip_parts]
         tok = f"{clip_prefix}/token_emb.bin"
         if tok not in names:
@@ -101,12 +93,23 @@ def main():
     else:
         print("warning: no text encoder parts found; publishing DiT only")
 
-    for extra in ("vae_decoder.bin", "vae_encoder.bin", "tokenizer.json"):
+    # tokenizer.json, token_emb.bin, clip and the VAE decoder are hard
+    # requirements in main.cpp's zimage branch -- the backend calls
+    # showHelpAndExit if any is absent -- so a missing one is fatal here rather
+    # than a warning. config.json and the ZIMAGE marker only matter for a
+    # manually imported copy, so they are included when present and skipped
+    # otherwise.
+    for extra in ("tokenizer.json", "vae_decoder.bin"):
+        src = f"partial/{extra}"
+        if src not in names:
+            raise SystemExit(f"{src} missing, and the backend requires it")
+        plan.append((src, extra))
+    for extra in ("vae_encoder.bin", "config.json", "ZIMAGE"):
         src = f"partial/{extra}"
         if src in names:
             plan.append((src, extra))
         else:
-            print(f"warning: {src} missing")
+            print(f"note: {src} absent, skipping (optional)")
 
     total = sum(sizes.get(src) or 0 for src, _ in plan)
     print(f"{len(plan)} files, {total / 1e9:.2f} GB")
