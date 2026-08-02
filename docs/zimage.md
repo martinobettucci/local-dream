@@ -700,3 +700,37 @@ and `hidden` for the output (`kZImageStateInNames` / `kZImageStateOutNames` in
 each exported graph and fails the run if any IO name is not what was asked for.
 
 `input_names` and `output_names` are requests, not guarantees. Verify them.
+
+**Why the quantizer needs so much memory: it retains every intermediate.**
+`qairt-quantizer` collects per-tensor min/max by *executing the graph on the
+QNN_CPU backend*, and to observe a tensor it has to keep it — so peak memory is
+roughly the sum of every intermediate tensor in the part, not the working set a
+normal inference would need. The failure lands inside graph execution:
+
+```
+[  INFO ] [QNN_CPU] QnnGraph finalize end
+[  INFO ] [QNN_CPU] QnnGraph execute start
+    <killed>
+```
+
+At the DiT's 1024x1024 shape that sum is dominated by one tensor per block. The
+unified sequence is `T = 4096 + 512 = 4608`, and attention is 30 heads, so a
+single score matrix is
+
+    30 x 4608 x 4608 x 4 B = 2.55 GB
+
+and softmax's output is another. Call it ~6 GB per block, against ~0.7 GB of
+fp32 weights per block — **activations dominate by an order of magnitude, and
+the block count is the only thing that scales them.**
+
+Measured, one part at a time, w4a16, on 16 GB RAM + 6 GB swap:
+
+| blocks/part | parts | export peak | convert peak | quantize peak | outcome |
+|---|---|---|---|---|---|
+| 4 | 8 | — | — | >19 GB | OOM-killed |
+| 2 | 15 | 5.3 GB | 3.4 GB | 15.4 GB RSS + ~5 GB swap | OOM-killed (rc 137, 202 s) |
+| 1 | 30 | — | — | — | see below |
+
+Note the export and convert stages are nowhere near the limit — export peaks at
+5.3 GB for a 2-block part and the converter at 3.4 GB. **Only quantization is
+memory-bound**, so there is no point splitting finer than quantization requires.
