@@ -16,3 +16,7 @@ app/src/main/assets/qnnlibs
 
 # Kotlin compiler session artifacts
 .kotlin/
+
+# Python bytecode
+__pycache__/
+*.pyc
