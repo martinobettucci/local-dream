@@ -342,9 +342,20 @@ runtime libraries are produced by a separate CMake build and are *gitignored*
 on a fresh clone therefore succeeds but yields an APK **with no native library
 in it**, which cannot run any model. The native build has to happen first.
 
-Prerequisites:
+Prerequisites, with the traps that cost the most time:
 
-- Android SDK (`compileSdk 37`), JDK 21, Gradle 9.3.1 (via the wrapper)
+- Android SDK (`compileSdk 37`), JDK 21, Gradle 9.3.1 (via the wrapper).
+  **The package is `platforms;android-37.0`, not `platforms;android-37`** —
+  platform packages are minor-versioned, and sdkmanager's error for the wrong
+  name is just `Failed to find package`. `--channel=1` will happily *list*
+  packages it then refuses to *install*; if in doubt, read the real package
+  names out of `https://dl.google.com/android/repository/repository2-3.xml`.
+- **Rust 1.81** for `tokenizers-cpp`. Its `tokenizers-c` crate trips
+  `implicit autoref creates a reference to the dereference of a raw pointer`,
+  which newer rustc (1.94 here) makes a hard error — `RUSTFLAGS=-A ...` does not
+  suppress it. `rustup override set 1.81.0` in the repo root is the fix; do not
+  patch the vendored source. `rustup target add aarch64-linux-android` is also
+  required, or the build dies on `can't find crate for 'core'`.
 - Android NDK **r28** at `/data/android-ndk-r28`, or `ANDROID_NDK_ROOT` set
   (see `app/src/main/cpp/CMakePresets.json`)
 - Qualcomm AI Engine Direct SDK **2.39.0.250926** at `/data/qairt/2.39.0.250926`

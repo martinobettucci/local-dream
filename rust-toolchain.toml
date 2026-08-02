@@ -1,0 +1,15 @@
+# Pins the Rust toolchain used to build tokenizers-cpp's `tokenizers-c` crate
+# during the native (app/src/main/cpp/build.sh) build.
+#
+# Newer rustc turns "implicit autoref creates a reference to the dereference of
+# a raw pointer" into a hard error, which that crate trips in two places. It is
+# not suppressible with RUSTFLAGS=-A, and patching a vendored submodule would
+# not survive a submodule update — so the toolchain is pinned instead.
+#
+# The window is narrow in both directions: the `tokenizers` dependency uses
+# `is_none_or`, stabilised in 1.82, so anything older fails with E0658. 1.85.0
+# satisfies both. Raise it once tokenizers-cpp is updated upstream.
+[toolchain]
+channel = "1.85.0"
+targets = ["aarch64-linux-android"]
+profile = "minimal"
