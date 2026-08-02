@@ -238,6 +238,41 @@ class PipelineZImage : public PipelineQnn {
                 cond.posPooled(), out_batch2 + single);
   }
 
+  void endDenoise() override {
+    if (!lowram_) return;
+    releaseDitParts();
+  }
+
+  void vaeDecode(const GenerationRequest &, const float *latents,
+                 float *pixels) override {
+    if (lowram_ && !vae_decoder_) {
+      vae_decoder_ =
+          qnn_runtime::createAndInitModel(vae_decoder_path_, "vae_decoder");
+      QNN_INFO("[lowram] Z-Image VAE decoder loaded");
+    }
+    if (!vae_decoder_) throw std::runtime_error("Z-Image VAE decoder missing");
+    if (StatusCode::SUCCESS !=
+        vae_decoder_->executeZImageVaeDecoder(latents, pixels))
+      throw std::runtime_error("Z-Image VAE decode failed");
+    // Stays loaded for the rest of the decode stage; released by
+    // releaseTransientModels() when generate() exits.
+  }
+
+  // Catch-all for lowram: release whatever stage model is still loaded when
+  // generate() exits (normal return or exception).
+  void releaseTransientModels() override {
+    if (!lowram_) return;
+    releaseClip();
+    releaseDitParts();
+    if (vae_decoder_) {
+      vae_decoder_.reset();
+      QNN_INFO("[lowram] Z-Image VAE decoder released");
+    }
+    releaseVaeEncoder();
+  }
+
+ private:
+
   // Number of image tokens: the DiT folds each 2x2 latch of latent into one
   // token, so a 128x128 latent becomes a 64x64 token grid.
   int imageTokens() const {
@@ -303,6 +338,51 @@ class PipelineZImage : public PipelineQnn {
       // Rows past the real prompt are replaced by the DiT's learned pad token.
       cap_pad_mask[i] = (i >= true_len) ? 1.0f : 0.0f;
     }
+  }
+
+  // One full pass of the DiT for a single CFG branch: part 1 folds the caption
+  // and the noised latent into the residual stream, each later part advances
+  // it, and the terminal part emits the flow velocity.
+  void runDitChain(const float *sample, float timestep, const float *context,
+                   const float *mask, float *out) {
+    if (!mask) throw std::runtime_error("Z-Image conditioning has no mask");
+    buildPositions(mask, pos_ids_, attn_mask_, cap_pad_mask_);
+    const size_t tokens = (size_t)totalTokens();
+
+    const size_t n = dit_part_paths_.size();
+    for (size_t i = 0; i < n; ++i) {
+      if (seq_dit_) loadDitPartAlone(i);
+      QnnModel *part = dit_parts_[i].get();
+      if (!part)
+        throw std::runtime_error("Z-Image DiT part " + std::to_string(i + 1) +
+                                 " not loaded");
+
+      // Only the part that actually declares `out_sample` may write the
+      // velocity; asking a mid-chain part for it would silently truncate the
+      // stream, so the buffer is handed over solely to the terminal part.
+      const bool terminal = part->zimageGraphIsTerminal();
+      if (terminal && i + 1 != n)
+        QNN_WARN("zimage: DiT part %zu is terminal but %zu parts were found; "
+                 "the remaining parts will not run",
+                 i + 1, n);
+
+      StatusCode st =
+          (i == 0) ? part->executeZImageDitFirst(
+                         sample, timestep, context, pos_ids_.data(),
+                         attn_mask_.data(), cap_pad_mask_.data(), tokens,
+                         dit_state_, terminal ? out : nullptr)
+                   : part->executeZImageDitNext(dit_state_, pos_ids_.data(),
+                                                attn_mask_.data(), tokens,
+                                                terminal ? out : nullptr);
+      if (seq_dit_) releaseDitPart(i);
+      if (st != StatusCode::SUCCESS)
+        throw std::runtime_error("Z-Image DiT part " + std::to_string(i + 1) +
+                                 " failed");
+      if (terminal) return;
+    }
+    throw std::runtime_error(
+        "Z-Image DiT chain ended without a terminal part (no graph exposes an "
+        "'out_sample' output)");
   }
 
   void runTextEncoder(const std::vector<float> &input_embedding,
