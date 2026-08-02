@@ -43,12 +43,18 @@ DIM = 3840
 CAP_FEAT_DIM = 2560
 
 # Modules a part only needs when it owns the head or the tail of the model.
-# Deleting the rest after construction is not just tidiness: at dim 3840 the two
-# refiner stacks and the embedders are well over a GB of randomly-initialised
-# fp32 that a middle part would otherwise carry through ONNX export.
 FIRST_ONLY = ("all_x_embedder", "cap_embedder", "t_embedder",
               "noise_refiner", "context_refiner")
 LAST_ONLY = ("all_final_layer",)
+
+# ...and the subset actually worth deleting on a middle part. The two refiner
+# stacks are two full-width blocks each, so at dim 3840 they are a couple of GB
+# of randomly-initialised fp32 that a middle part would otherwise carry all the
+# way through ONNX export. The rest are small, and deleting them only creates
+# ways for code that legitimately reads their shapes to fail: StaticZImageDiT
+# needs t_embedder's output width even on a part that never runs it, because
+# `emb` is one of that part's graph inputs.
+DROP_ON_MIDDLE = ("noise_refiner", "context_refiner")
 
 
 def log(msg):
@@ -155,11 +161,11 @@ def build_part(sd, n_blocks, first, last):
     )
     # Drop what this part will not trace before loading, so the randomly
     # initialised originals are freed rather than merely overwritten.
-    drop = ([] if first else list(FIRST_ONLY)) + ([] if last else list(LAST_ONLY))
-    for attr in drop:
-        if hasattr(model, attr):
-            delattr(model, attr)
-    gc.collect()
+    if not first:
+        for attr in DROP_ON_MIDDLE:
+            if hasattr(model, attr):
+                delattr(model, attr)
+        gc.collect()
 
     sd = {k: v.to(torch.float32) for k, v in sd.items()}
     missing, unexpected = model.load_state_dict(sd, strict=False)

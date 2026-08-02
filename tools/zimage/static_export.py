@@ -201,8 +201,15 @@ class StaticZImageDiT(nn.Module):
         model runs 256 -> 1024 -> 256 while dim is 3840. Small test configs can
         make the two coincide, which hides the difference until real weights
         turn up.
+
+        A part that does not run the embedder still needs the width, since `emb`
+        is one of its graph inputs — so fall back to the adaLN modulation that
+        every block carries, which is derived from the same vector.
         """
-        return self.m.t_embedder.mlp[-1].out_features
+        t_embedder = getattr(self.m, "t_embedder", None)
+        if t_embedder is not None:
+            return t_embedder.mlp[-1].out_features
+        return self.m.layers[0].adaLN_modulation[-1].in_features
 
     @property
     def output_names(self):
