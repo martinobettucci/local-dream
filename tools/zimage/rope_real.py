@@ -34,6 +34,31 @@ def _rope_call_real(self, ids: torch.Tensor):
     return torch.cat([self.freqs_cis[i][ids[:, i]] for i in range(len(self.axes_dims))], dim=-2)
 
 
+# The additive mask value, and it is NOT just "a large negative".
+#
+# `scores + mask` is a real activation, and act_bitwidth 16 encodes it over the
+# min/max observed during calibration -- where the mask IS observed, since
+# make_calib.py feeds a genuine 0/1 attn_mask. So the mask value single-handedly
+# sets the bottom of that tensor's encoding range, and every unmasked score has
+# to share whatever resolution is left.
+#
+# Measured at the real shapes (head_dim 128, T 4608, 384 masked, q/k RMSNormed,
+# asymmetric uint16 over observed min/max), as mean relative error on the
+# attention output:
+#
+#     mask     quant step   error
+#     -1e4       0.15276    4.40 %      <- range [-10004, +6]
+#     -200       0.00324    0.09 %
+#     -100       0.00171    0.05 %      <- range [-106, +6]
+#
+# An 85x precision loss on the most sensitive tensor in the block, repeated over
+# 30 blocks and 8 steps, for no benefit: -100 masks just as totally. The mask
+# only has to underflow the softmax, and with max|score| measured at 6-17,
+# exp(-100 - 17) = 4e-51 against the softmax output's own 16-bit resolution of
+# 1.5e-5. That is ~45 decades of margin. Do not "harden" this back toward -inf.
+MASK_NEG = -100.0
+
+
 def _apply_rotary_emb_real(x_in: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     # x_in: [B, seq, heads, head_dim]; freqs_cis: [B, seq, head_dim/2, 2]
     x = x_in.float().reshape(*x_in.shape[:-1], -1, 2)   # [B, seq, heads, hd/2, 2]
@@ -82,8 +107,7 @@ def _processor_call(self, attn, hidden_states, encoder_hidden_states=None,
     # No NaN guard is needed here because no row is ever fully masked: this
     # runner's mask always keeps at least the image tokens, which come first.
     # An additive float mask, not a boolean one, for the same reason -- 0 where
-    # attending is allowed, a large negative where it is not, and -1e4 rather
-    # than -inf so 16-bit activation quantization has a finite range to encode.
+    # attending is allowed, MASK_NEG where it is not.
     scale = q.shape[-1] ** -0.5
     scores = torch.matmul(q, k.transpose(-2, -1)) * scale
     if attention_mask is not None:
@@ -91,7 +115,7 @@ def _processor_call(self, attn, hidden_states, encoder_hidden_states=None,
             attention_mask = torch.where(
                 attention_mask,
                 torch.zeros((), dtype=scores.dtype),
-                torch.full((), -1e4, dtype=scores.dtype))
+                torch.full((), MASK_NEG, dtype=scores.dtype))
         scores = scores + attention_mask.to(scores.dtype)
     hs = torch.matmul(torch.softmax(scores, dim=-1), v)
     hs = hs.transpose(1, 2).flatten(2).type_as(query)

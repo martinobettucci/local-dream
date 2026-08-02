@@ -37,10 +37,23 @@ SUBDIR = "text_encoder"
 SEQ = 512               # zimage_text_seq_len
 DIM = 2560              # zimage_text_embedding_size
 
-# Masked positions get a large negative rather than -inf: activations are
+# Masked positions get a finite negative rather than -inf: activations are
 # quantized to 16 bits, and -inf survives neither the encoding search nor a
 # fully-masked softmax row.
-NEG = -1e4
+#
+# The magnitude matters, and this case is worse than the DiT's. `scores + mask`
+# is an activation encoded over its observed min/max at act_bitwidth 16, so the
+# mask sets the bottom of that range -- and here the causal triangle masks
+# roughly half of every score matrix on *every* prompt, regardless of padding,
+# so the value is always observed. At -1e4 the encoding spans [-1e4, +max] and
+# the real scores get a quantization step of ~0.15 instead of ~0.002; measured
+# on the DiT's identically-shaped attention that is 4.4 % versus 0.05 % mean
+# relative error on the attention output.
+#
+# -100 masks just as totally: the mask only needs to underflow the softmax, and
+# exp(-100 - max_score) is ~1e-51 against the output's own 16-bit resolution of
+# 1.5e-5. Shared with rope_real.MASK_NEG; keep the two in step.
+NEG = -100.0
 
 
 def log(msg):
