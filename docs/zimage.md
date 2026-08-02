@@ -928,3 +928,38 @@ The HTP backend documents INT4 explicitly
 listing where the power and latency benefits apply — Conv2D 1x1, FullyConnected
 and MatMul with `out_channels > 32`, which is essentially every weight in the
 DiT. There is no INT2 equivalent page.
+
+**Nothing makes the context binary smaller. Measured, not reasoned.** One
+1-block DiT part is **384,126,976 bytes** — 2.12 bytes per parameter, against
+1.00 in the DLC it was compiled from. Every lever the toolchain offers was
+tried on that same part:
+
+| lever | context binary | vs baseline |
+|---|---|---|
+| `--weights_bitwidth 4` (baseline) | 384,126,976 | — |
+| `--weights_bitwidth 2` | identical DLC, so identical | 1.00x |
+| `--weights_bitwidth 8` | identical DLC, so identical | 1.00x |
+| `--pack_4_bit_weights` | — | **rejected by the HTP** |
+| `--disable_dynamic_16_bit_weights` | 392,339,456 | **1.02x — larger** |
+
+The `use_dynamic_16_bit_weights` default looked like the culprit: 181 M
+parameters at 16 bits is 362 MB, and 362 + ~22 MB of graph metadata is almost
+exactly the 384 MB observed. Disabling it made the binary *bigger*. So the
+doubling is not weight promotion, and there is no flag that undoes it.
+
+**Part count is the one remaining lever, and quantization RAM caps it.** The
+VAE decoder — a far smaller graph — compiles to 198 MB, so a large part of each
+context binary is fixed overhead rather than weights. That implies fewer, larger
+parts would produce a smaller model overall:
+
+| split | parts | est. total | quantize peak |
+|---|---|---|---|
+| 1 block | 30 | ~11.5 GB | 11.2 GB — fits |
+| 2 blocks | 15 | ~8 GB | ~17 GB — did not fit |
+| 4 blocks | 8 | ~7 GB | >19 GB — did not fit |
+
+The 2- and 4-block figures were measured before the attention rewrite, which cut
+the 1-block quantize peak from 14.2 GB to 11.2 GB; 2 blocks may now be within
+reach of a 16 GB box and would certainly fit a 32 GB one. **This is the thing to
+revisit on a larger conversion machine** — not the weight width, which does
+nothing.
