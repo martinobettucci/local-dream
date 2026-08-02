@@ -2347,7 +2347,9 @@ private fun FileManagerDialog(context: Context, onDismiss: () -> Unit, onFileDel
 
             if (modelsDir.exists() && modelsDir.isDirectory) {
                 modelsDir.listFiles()?.forEach { modelDir ->
-                    if (modelDir.isDirectory) {
+                    // Skip ".staging_<id>": an in-flight multi-file download,
+                    // not a model folder.
+                    if (modelDir.isDirectory && !modelDir.name.startsWith(".")) {
                         val fileCount = modelDir.listFiles()?.size ?: 0
                         if (fileCount > 0) {
                             result.add(Pair(modelDir.name, fileCount))

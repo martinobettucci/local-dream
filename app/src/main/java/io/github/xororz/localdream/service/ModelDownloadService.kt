@@ -20,6 +20,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -359,23 +360,49 @@ class ModelDownloadService : Service() {
             ManifestEntry(name, o.optLong("size", -1L))
         }
 
-        val modelDir = File(getModelsDir(), modelId).apply { mkdirs() }
+        // Download into a staging directory, not the model directory.
+        //
+        // Model.isModelDownloaded treats any non-empty model directory as a
+        // complete model. Writing files there as they arrive would make an
+        // interrupted download indistinguishable from a finished one: the app
+        // would list the model as ready, the backend would fail on the parts
+        // that never arrived, and there would be no download button left to
+        // retry with. Staging keeps that state invisible until every file is
+        // present, while still persisting across attempts so a retry resumes
+        // instead of starting over.
+        val modelDir = File(getModelsDir(), modelId)
+        val stageDir = File(getModelsDir(), ".staging_$modelId").apply { mkdirs() }
+
+        // A previous attempt may have staged files for a different manifest --
+        // a re-converted model with a different part count, say. Leaving them
+        // would mix parts from two conversions, and the backend discovers parts
+        // by counting upward from 1, so the extras would be loaded as if they
+        // belonged.
+        val wanted = files.map { it.name }.toSet()
+        stageDir.listFiles()?.forEach { f ->
+            if (f.name !in wanted && !f.name.endsWith(".part")) {
+                Log.i(TAG, "manifest: dropping stale staged " + f.name)
+                f.delete()
+            }
+        }
+
         val grandTotal = files.sumOf { if (it.size > 0) it.size else 0L }
 
         // Anything already the right size is left alone, so a retry resumes.
         var done = files.filter { e ->
-            e.size > 0 && File(modelDir, e.name).length() == e.size
+            e.size > 0 && File(stageDir, e.name).length() == e.size
         }.sumOf { it.size }
 
         for (entry in files) {
-            val target = File(modelDir, entry.name)
+            ensureActive()
+            val target = File(stageDir, entry.name)
             if (entry.size > 0 && target.length() == entry.size) {
                 Log.i(TAG, "manifest: ${entry.name} already complete, skipping")
                 continue
             }
             target.delete()
 
-            val part = File(modelDir, entry.name + ".part")
+            val part = File(stageDir, entry.name + ".part")
             part.delete()
             downloadFile("$baseUrl/${entry.name}", part, modelId, modelName, done, grandTotal)
 
@@ -392,10 +419,20 @@ class ModelDownloadService : Service() {
                 part.delete()
                 throw Exception("Could not finalize ${entry.name}")
             }
-            done += if (entry.size > 0) entry.size else part.length()
+            done += if (entry.size > 0) entry.size else target.length()
         }
 
-        if (isNpu) File(modelDir, "v3").createNewFile()
+        if (isNpu) File(stageDir, "v3").createNewFile()
+
+        // Everything is present: swap staging into place as one step. Any
+        // earlier install is removed first so a re-download cannot leave files
+        // from the previous manifest behind.
+        if (modelDir.exists() && !modelDir.deleteRecursively()) {
+            throw Exception("Could not replace the existing model directory")
+        }
+        if (!stageDir.renameTo(modelDir)) {
+            throw Exception("Could not move the downloaded model into place")
+        }
     }
 
     private suspend fun unzipFile(zipFile: File, destDir: File) = withContext(Dispatchers.IO) {

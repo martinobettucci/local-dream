@@ -421,6 +421,18 @@ class PipelineZImage : public PipelineQnn {
         throw std::runtime_error("Z-Image text encoder part " +
                                  std::to_string(i + 1) + " not loaded");
       const bool last = (i + 1 == clip_parts_.size());
+      // The chain has to END on the part that emits `context`. If the model
+      // directory is missing trailing parts -- an interrupted download, a
+      // hand-assembled directory -- discovery stops at the first gap and the
+      // chain looks complete, but its last graph emits `hidden`: a mid-stack
+      // activation that would be handed to the DiT as if it were the encoder's
+      // output. Nothing downstream can tell the difference, so check here.
+      if (last && !part->zimageClipGraphIsTerminal())
+        throw std::runtime_error(
+            "Z-Image text encoder chain ends at part " + std::to_string(i + 1) +
+            " of " + std::to_string(clip_parts_.size()) +
+            ", which emits 'hidden' rather than 'context' — the model "
+            "directory is missing later clip_part*.bin files");
       // The last part writes straight into the caller's buffer; the rest hand
       // off through clip_state_.
       float *dst = last ? out_hidden : clip_state_.data();
@@ -455,19 +467,32 @@ class PipelineZImage : public PipelineQnn {
   // elsewhere at that moment.
   void loadClipIfNeeded() {
     if (!clip_parts_.empty() && clip_parts_.front()) return;
+    // The parts execute strictly in sequence and never concurrently, so they
+    // share one HTP spill-fill scratch buffer rather than allocating one each.
+    // With a single clip.bin that distinction did not exist; with six of them
+    // it is the difference between one scratch allocation and six.
+    const uint64_t sf_bytes = spillFillGroupBytes();
+    Qnn_ContextHandle_t head = nullptr;
     for (size_t i = 0; i < clip_part_paths_.size(); ++i) {
-      clip_parts_[i] = qnn_runtime::createAndInitModel(clip_part_paths_[i],
-                                                       clipTag(i).c_str());
+      clip_parts_[i] =
+          qnn_runtime::createModel(clip_part_paths_[i], clipTag(i).c_str());
       if (!clip_parts_[i])
-        throw std::runtime_error("[lowram] Failed to load Z-Image text encoder "
+        throw std::runtime_error("[lowram] Failed to create Z-Image text "
+                                 "encoder part " + std::to_string(i + 1));
+      clip_parts_[i]->setSpillFillGroup(sf_bytes, head);
+      if (qnn_runtime::initializeApp(clipTag(i).c_str(), clip_parts_[i]) !=
+          EXIT_SUCCESS)
+        throw std::runtime_error("[lowram] Failed to init Z-Image text encoder "
                                  "part " + std::to_string(i + 1));
+      if (i == 0 && sf_bytes) head = clip_parts_[0]->getContextHandle();
     }
     QNN_INFO("[lowram] Z-Image text encoder loaded (%zu part(s))",
              clip_parts_.size());
   }
   void releaseClip() {
     if (clip_parts_.empty() || !clip_parts_.front()) return;
-    for (auto &p : clip_parts_) p.reset();
+    // Reverse order: every group reference dies before its head (part 1).
+    for (size_t i = clip_parts_.size(); i-- > 0;) clip_parts_[i].reset();
     clip_state_.clear();
     clip_state_.shrink_to_fit();
     if (lowram_) QNN_INFO("[lowram] Z-Image text encoder released");

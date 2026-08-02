@@ -451,6 +451,12 @@ class ModelRepository private constructor(private val context: Context) {
         if (modelsDir.exists() && modelsDir.isDirectory) {
             modelsDir.listFiles()?.forEach { dir ->
                 if (!dir.isDirectory) return@forEach
+                // A leading dot marks scratch state, not a model: the download
+                // service stages a multi-file model in ".staging_<id>" so a
+                // half-finished download is not mistaken for an installed one.
+                // Listing that as a custom model would surface exactly the
+                // broken half-model the staging exists to hide.
+                if (dir.name.startsWith(".")) return@forEach
 
                 val modelId = dir.name
                 if (modelId in RESERVED_MODEL_IDS) {

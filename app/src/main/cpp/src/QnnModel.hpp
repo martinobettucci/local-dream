@@ -1192,6 +1192,17 @@ class QnnModel : public QnnSampleApp {
                : StatusCode::FAILURE;
   }
 
+  // True when this graph ends the encoder chain (emits the final `context`
+  // rather than a mid-stack hand-off). Mirrors zimageGraphIsTerminal for the
+  // DiT, and exists for the same reason: a chain that is short by a part still
+  // runs, and without this check its last hidden state would silently be used
+  // as the text embedding.
+  bool zimageClipGraphIsTerminal() {
+    if (!ensureIoTensors()) return false;
+    auto graphInfo = (*m_graphsInfo)[0];
+    return findTensor(outputs, graphInfo.numOutputTensors, "context") != nullptr;
+  }
+
   // The terminal part of the encoder chain emits "context"; every earlier part
   // emits "hidden". A single-part encoder is terminal, so it emits "context"
   // too and the same read serves both layouts.
