@@ -800,3 +800,32 @@ for the same ONNX naming reason:
 | 1 | `input_embedding` `[1,512,2560]`, `attention_mask` `[1,512]` | `hidden` |
 | middle | `hidden_in`, `attention_mask` | `hidden` |
 | last | `hidden_in`, `attention_mask` | `context` `[1,512,2560]` |
+
+**Calibration data has to look like runtime data, or the model runs and
+produces garbage.** The quantizer derives every activation's min/max by
+executing the graph on the calibration inputs, so an input whose calibration
+distribution does not match runtime yields an encoding that clips or wastes its
+whole range. The first version of this filled every float input with `N(0,1)`
+and every int input with zeros, which is wrong for four of the DiT's six:
+
+| input | N(0,1) / zeros gives | reality |
+|---|---|---|
+| `timestep` | ~±3 | `sigma * 1000`, so ~1000 down to ~3 over 8 steps |
+| `pos_ids` | all zeros | real 3D RoPE `(t, h, w)`; at position 0 the rotation is the identity, so no downstream tensor sees its true range |
+| `attn_mask` | noise around 0 | a 0/1 indicator |
+| `cap_pad_mask` | noise around 0 | a 0/1 indicator |
+
+Only `sample`, `hidden_in`, `emb` and `context` are legitimately near-Gaussian.
+`tools/zimage/make_calib.py` builds the rest properly, taking the positions from
+`static_export.build_positions()` — the same function the export uses and the
+C++ mirrors, rather than a numpy reimplementation, because that particular piece
+of arithmetic diverging is what once measured 15.6 % error.
+
+`timestep` gets the **top** of the schedule (1000). One calibration sample can
+only pin one value per input, and the quantizer's range spans what it observed;
+calibrating at the small end would clip every early step, which is where the
+image is actually decided.
+
+This is the worst kind of bug in this pipeline: nothing fails. The part exports,
+converts, quantizes and compiles, and only the images are wrong — after all 30
+parts have been built.

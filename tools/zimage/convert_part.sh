@@ -60,28 +60,20 @@ run export "$PY" "$SCRATCH/export_dit.py" --work "$W" --parts "$NPARTS" --only "
 [ -f "$ODIR/unet_part$N.onnx" ] || { echo "export produced no ONNX"; exit 1; }
 say "2/5 ONNX built"
 
-# Calibration inputs must match the graph's declared names, shapes and dtypes,
-# so they are read off the ONNX itself rather than hardcoded — and therefore
-# built while it still exists. pos_ids is int32, everything else fp32. ONE
-# sample only: qairt-quantizer holds activations for every sample and OOM-killed
+# Calibration inputs are read off the ONNX (names, shapes and dtypes have to
+# match exactly) and therefore built while it still exists. They are NOT random:
+# make_calib.py gives timestep, pos_ids and the masks their real runtime
+# distributions, because the quantizer derives every activation's range from
+# these and a wrong one produces a model that runs and generates garbage.
+# ONE sample: qairt-quantizer holds activations for every sample and OOM-killed
 # a 15 GB box with four.
-"$QNN" - "$W" "$N" "$ODIR/unet_part$N.onnx" <<'PY'
-import numpy as np, os, sys, onnx
-W, N, path = sys.argv[1], sys.argv[2], sys.argv[3]
-c = f"{W}/calib{N}"; os.makedirs(c, exist_ok=True)
-m = onnx.load(path, load_external_data=False)
-rng = np.random.default_rng(0); parts = []
-for i in m.graph.input:
-    dims = [d.dim_value for d in i.type.tensor_type.shape.dim]
-    p = os.path.abspath(f"{c}/{i.name}.raw")
-    if i.type.tensor_type.elem_type == onnx.TensorProto.INT32:
-        np.zeros(dims, dtype=np.int32).tofile(p)
-    else:
-        rng.standard_normal(dims, dtype=np.float32).tofile(p)
-    parts.append(f"{i.name}:={p}")
-open(f"{W}/calib{N}.txt", "w").write(" ".join(parts) + "\n")
-print("  calib inputs:", " ".join(x.split(":=")[0] for x in parts))
-PY
+#
+# Run with $PY, not $QNN: the positions come from static_export.build_positions,
+# the same function the export uses and the C++ mirrors, so it needs torch. That
+# is deliberate -- reimplementing the coordinate arithmetic here in numpy would
+# be a second source of truth for the one piece of this pipeline whose earlier
+# divergence measured 15.6 % error.
+"$PY" "$SCRATCH/make_calib.py" "$ODIR/unet_part$N.onnx" "$W/calib$N" "$W/calib$N.txt"
 
 # Never pipe a stage through tail: the pipeline's exit status is tail's, so a
 # failed converter looks like success under `set -e`. Log in full, then verify

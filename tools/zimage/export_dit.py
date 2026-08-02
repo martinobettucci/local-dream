@@ -171,11 +171,20 @@ def build_part(sd, n_blocks, first, last):
     missing, unexpected = model.load_state_dict(sd, strict=False)
     del sd
     gc.collect()
-    # A middle part legitimately lacks embedders and the final layer; those
-    # modules have just been deleted, so they cannot show up as missing either.
-    missing = [m for m in missing if not m.startswith("layers.")]
     if unexpected:
         raise RuntimeError(f"unexpected tensors for part: {unexpected[:5]}")
+    # `layers.*` is the one thing that must NEVER be missing: an absent block
+    # weight leaves that block randomly initialised, and the part then exports,
+    # converts, quantizes and compiles without complaint. An earlier version
+    # filtered these out of `missing` before checking anything, which is exactly
+    # backwards -- it silenced the only fatal case and kept the benign ones.
+    absent_blocks = [m for m in missing if m.startswith("layers.")]
+    if absent_blocks:
+        raise RuntimeError(
+            f"part is missing {len(absent_blocks)} block weight(s), which would "
+            f"export as random values: {absent_blocks[:5]}")
+    # A middle part legitimately lacks the embedders and the final layer -- it
+    # never traces them, and DROP_ON_MIDDLE has already deleted the big ones.
     if first and any(m.startswith(FIRST_ONLY) for m in missing):
         raise RuntimeError(f"part 1 is missing embedder weights: {missing[:5]}")
     if last and any(m.startswith(LAST_ONLY) for m in missing):
