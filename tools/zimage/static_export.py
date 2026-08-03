@@ -159,7 +159,7 @@ class StaticZImageDiT(nn.Module):
         x = x.reshape(1, c * p * p, self.grid_h, self.grid_w)
         return torch.nn.functional.pixel_shuffle(x, p)       # [1, C, H, W]
 
-    def _embed(self, sample, timestep, context, freqs, mask, cap_pad_mask):
+    def _embed(self, sample, timestep, context, freqs, attn_mask, cap_pad_mask):
         """Everything part 1 does before the main blocks."""
         m = self.m
         # `timestep` is already sigma * t_scale (the value t_embedder consumes);
@@ -168,7 +168,14 @@ class StaticZImageDiT(nn.Module):
 
         img_freqs = freqs[:, :self.n_img]
         cap_freqs = freqs[:, self.n_img:]
-        cap_mask = mask[:, self.n_img:]
+        # Slice the FLOAT mask and compare afterwards, never the other way
+        # round. QNN's StridedSlice does not accept a boolean input, and slicing
+        # the already-compared mask puts a Bool_8 tensor into it:
+        #     [QNN_CPU] OpConfig validation failed for StridedSlice
+        #     QnnModel::addNode() validating node /Slice_2 failed
+        # That surfaces only at quantization, only on part 1 (no other part runs
+        # the caption refiner), after the 3.63 GB DLC has already been built.
+        cap_mask = attn_mask[:, self.n_img:] > 0.5
 
         x = m.all_x_embedder[self.key](self._patchify(sample))
         for layer in m.noise_refiner:
@@ -194,8 +201,10 @@ class StaticZImageDiT(nn.Module):
         mask = attn_mask > 0.5
 
         if self.first:
+            # attn_mask (float), not mask (bool): _embed slices it, and QNN's
+            # StridedSlice rejects a boolean input.
             hidden, emb = self._embed(sample, timestep, context, freqs,
-                                      mask, cap_pad_mask)
+                                      attn_mask, cap_pad_mask)
 
         for layer in self.m.layers[self.block_start:self.block_end]:
             hidden = layer(hidden, mask, freqs, emb)
