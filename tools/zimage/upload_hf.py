@@ -90,11 +90,31 @@ def main():
             print(f"(dry-run) would upload {args.put} -> {remote}")
             return
         api.create_repo(args.repo, repo_type="model", exist_ok=True)
-        api.upload_file(path_or_fileobj=args.put, path_in_repo=remote,
-                        repo_id=args.repo, repo_type="model")
-        print(f"uploaded {remote} "
-              f"({os.path.getsize(args.put) / 1e6:.1f} MB)")
-        return
+        # Retry with backoff. A conversion run is hours long and every part is
+        # uploaded the moment it exists, so a few seconds of network trouble
+        # would otherwise abort the whole run under `set -e` and throw away the
+        # 40 minutes of compute that produced the part. Observed in practice:
+        # "httpx.ConnectError: [Errno 111] Connection refused" mid-run, from a
+        # transient proxy blip rather than anything wrong with the file.
+        import time
+
+        last = None
+        for attempt in range(5):
+            try:
+                api.upload_file(path_or_fileobj=args.put, path_in_repo=remote,
+                                repo_id=args.repo, repo_type="model")
+                print(f"uploaded {remote} "
+                      f"({os.path.getsize(args.put) / 1e6:.1f} MB)"
+                      + (f" [attempt {attempt + 1}]" if attempt else ""))
+                return
+            except Exception as exc:  # noqa: BLE001 - re-raised below
+                last = exc
+                if attempt + 1 < 5:
+                    wait = 2 ** attempt * 5
+                    print(f"upload of {remote} failed ({type(exc).__name__}), "
+                          f"retrying in {wait}s")
+                    time.sleep(wait)
+        raise SystemExit(f"upload of {remote} failed after 5 tries: {last}")
 
     who = api.whoami()
     print(f"authenticated as {who.get('name')}; target repo {args.repo}")
