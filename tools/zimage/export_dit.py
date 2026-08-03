@@ -69,7 +69,18 @@ def free_gb(path):
 def plan_parts(n_parts, n_layers=N_LAYERS):
     """Contiguous, near-equal block ranges. Part 1 and part N carry the extra
     embedder / final-layer work, so they get one fewer block where it divides
-    unevenly."""
+    unevenly.
+
+    n_parts == n_layers + 1 is the special case that makes this model
+    convertible on a 16 GB machine: part 1 gets NO blocks and carries only the
+    embedders and the two refiner stacks, and blocks 0..n-1 go to parts 2..n+1.
+    Otherwise part 1 holds the embedders, both refiners AND a block, whose
+    quantization needs >21 GB -- the image refiner's 4096-token attention alone
+    (2 layers, 4096^2, 30 heads, scores and softmax both retained by the
+    quantizer) is ~8 GB before the block's 4608^2 is counted.
+    """
+    if n_parts == n_layers + 1:
+        return [(0, 0)] + [(i, i + 1) for i in range(n_layers)]
     if not 1 <= n_parts <= n_layers:
         raise ValueError(f"n_parts must be in 1..{n_layers}, got {n_parts}")
     base, extra = divmod(n_layers, n_parts)
@@ -152,15 +163,22 @@ def build_part(sd, n_blocks, first, last):
 
     from static_export import StaticZImageDiT
 
+    # n_layers=0 is not constructible, so a block-less first part is built with
+    # one block and then has it removed: the wrapper's [0:0] slice never touches
+    # it, and leaving it would carry 724 MB of randomly-initialised fp32 all the
+    # way through ONNX export.
     model = ZImageTransformer2DModel(
         all_patch_size=[2], all_f_patch_size=[1], in_channels=16,
-        dim=DIM, n_layers=n_blocks, n_refiner_layers=2, n_heads=30, n_kv_heads=30,
+        dim=DIM, n_layers=max(n_blocks, 1), n_refiner_layers=2, n_heads=30, n_kv_heads=30,
         norm_eps=1e-5, qk_norm=True, cap_feat_dim=CAP_FEAT_DIM,
         rope_theta=256.0, t_scale=1000.0,
         axes_dims=[32, 48, 48], axes_lens=[1536, 512, 512],
     )
     # Drop what this part will not trace before loading, so the randomly
     # initialised originals are freed rather than merely overwritten.
+    if n_blocks == 0:
+        import torch.nn as _nn
+        model.layers = _nn.ModuleList()
     if not first:
         for attr in DROP_ON_MIDDLE:
             if hasattr(model, attr):

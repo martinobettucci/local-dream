@@ -110,15 +110,25 @@ class StaticZImageDiT(nn.Module):
         n_layers = len(model.layers)
         self.block_start = int(block_start)
         self.block_end = n_layers if block_end is None else int(block_end)
-        if not 0 <= self.block_start < self.block_end <= n_layers:
-            raise ValueError(f"bad block range [{block_start}, {block_end}) of {n_layers}")
+        # An EMPTY range is legal for a first part, and is the only way to
+        # convert this model on a 16 GB machine. Part 1 otherwise carries the
+        # embedders, both refiner stacks AND a transformer block; quantizing
+        # that needs >21 GB, because the image refiner's 4096-token attention
+        # (2 layers x 4096^2 x 30 heads, scores and softmax both retained) is
+        # ~8 GB on its own, on top of the block's 4608^2. Splitting the
+        # embedders into a block-less part brings each piece under the ceiling.
         # Derived from the block range for a whole model, but overridable: the
         # 6B model never fits in RAM at once, so each part is built as a REDUCED
         # ZImageTransformer2DModel holding only its own blocks (renumbered from
         # 0). Such a piece looks like [0, n) — i.e. both first and last — when it
-        # is really neither, so the caller states which it is.
+        # is really neither, so the caller states which it is. Resolved before
+        # the range check because an empty range is legal only for a first part.
         self.first = (self.block_start == 0) if first is None else bool(first)
         self.last = (self.block_end == n_layers) if last is None else bool(last)
+
+        empty_ok = self.first and self.block_start == self.block_end
+        if not (empty_ok or 0 <= self.block_start < self.block_end <= n_layers):
+            raise ValueError(f"bad block range [{block_start}, {block_end}) of {n_layers}")
 
         # Checked here rather than up front because a middle part has neither
         # module: export_dit.py deletes them before loading so a 2-block part
