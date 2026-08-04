@@ -323,6 +323,9 @@ class BackgroundGenerationService : Service() {
                 .post(jsonObject.toString().toRequestBody("application/json".toMediaTypeOrNull()))
                 .build()
 
+            // Outlives the response block so a broken stream can say where it
+            // broke.
+            var lastStage = ""
             val call = generationClient.newCall(request)
             activeCall = call
             call.execute().use { response ->
@@ -359,6 +362,13 @@ class BackgroundGenerationService : Service() {
                     // Read line by line for efficiency
                     readLoop@ while (isActive) {
                         val readLineStart = System.currentTimeMillis()
+                        // A null line is a CLEAN end of stream, not an
+                        // exception -- which is exactly what a backend killed
+                        // by the low-memory killer looks like from here. The
+                        // loop used to fall out of it with no result, no
+                        // exception and therefore no error state, leaving the
+                        // UI in Progress for as long as the user was willing to
+                        // wait. `completed` below tells the two exits apart.
                         val line = reader.readLine() ?: break
                         val readLineTime = System.currentTimeMillis() - readLineStart
 
@@ -383,6 +393,7 @@ class BackgroundGenerationService : Service() {
                                     }
                                     subProgress =
                                         if (total > 0) done.toFloat() / total else -1f
+                                    lastStage = subLabel
                                     // Reuse the last coarse progress and preview:
                                     // a sub-step changes neither.
                                     updateState(
@@ -569,6 +580,20 @@ class BackgroundGenerationService : Service() {
                         }
                     }
                 }
+            }
+            if (!completed && !cancelRequested && isActive) {
+                // Naming the stage is the whole diagnosis: "it broke" against
+                // "it broke loading text encoder part 3 of 6".
+                val where = if (lastStage.isNotEmpty()) " ($lastStage)" else ""
+                Log.e("BgGenService", "backend stream ended with no result$where")
+                updateState(
+                    GenerationState.Error(
+                        this@BackgroundGenerationService.getString(
+                            R.string.backend_stream_ended,
+                        ) + where,
+                    ),
+                )
+                stopSelf()
             }
         } catch (e: Exception) {
             if (completed) {

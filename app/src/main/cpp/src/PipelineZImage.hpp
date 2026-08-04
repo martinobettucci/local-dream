@@ -220,8 +220,8 @@ class PipelineZImage : public PipelineQnn {
 
   void encodeText(const ProcessedPromptPair &prompts, bool need_negative,
                   bool need_positive, Conditioning &cond) override {
-    if (lowram_) loadClipIfNeeded();
-    if (clip_parts_.empty() || !clip_parts_.front())
+    if (lowram_ && !seq_dit_) loadClipIfNeeded();
+    if (!seq_dit_ && (clip_parts_.empty() || !clip_parts_.front()))
       throw std::runtime_error("Z-Image text encoder not initialized!");
     if (need_negative)
       runTextEncoder(prompts.negative_embeddings, prompts.negative_qwen_mask,
@@ -477,11 +477,19 @@ class PipelineZImage : public PipelineQnn {
         (size_t)zimage_text_seq_len * zimage_text_embedding_size;
     if (clip_state_.size() != elems) clip_state_.assign(elems, 0.0f);
     for (size_t i = 0; i < clip_parts_.size(); ++i) {
+      reportSub("Text encoder", (int)i, (int)clip_parts_.size());
+      // One context at a time, for the same reason the DiT does it: six
+      // 620 MB encoder contexts co-resident is 3.6 GB of HTP allocations on
+      // top of the 778 MB token-embedding table, and the process does not
+      // survive that on a 16 GB device -- it is killed outright, which from
+      // the app looks like a stream that simply ends. The encoder runs once
+      // per prompt, so reloading costs a fraction of what the DiT's per-step
+      // reloading costs.
+      if (seq_dit_) loadClipPartAlone(i);
       auto &part = clip_parts_[i];
       if (!part)
         throw std::runtime_error("Z-Image text encoder part " +
                                  std::to_string(i + 1) + " not loaded");
-      reportSub("Text encoder", (int)i, (int)clip_parts_.size());
       const bool last = (i + 1 == clip_parts_.size());
       // The chain has to END on the part that emits `context`. If the model
       // directory is missing trailing parts -- an interrupted download, a
@@ -503,6 +511,9 @@ class PipelineZImage : public PipelineQnn {
                                                     mask.data(), dst)
                    : part->executeZImageClipNext(clip_state_.data(),
                                                  mask.data(), dst);
+      // Released before the failure check, so a part that fails does not stay
+      // resident while the exception unwinds past the rest of the chain.
+      if (seq_dit_) clip_parts_[i].reset();
       if (st != StatusCode::SUCCESS)
         throw std::runtime_error("Z-Image text encoder part " +
                                  std::to_string(i + 1) + " failed");
@@ -639,6 +650,16 @@ class PipelineZImage : public PipelineQnn {
   void releaseDitPart(size_t i) {
     if (!dit_parts_[i]) return;
     dit_parts_[i].reset();
+  }
+  // seq mode: one encoder context resident at a time, with its own spill-fill
+  // buffer (no group sharing -- the parts are never co-resident).
+  void loadClipPartAlone(size_t i) {
+    if (clip_parts_[i]) return;
+    clip_parts_[i] =
+        qnn_runtime::createAndInitModel(clip_part_paths_[i], clipTag(i).c_str());
+    if (!clip_parts_[i])
+      throw std::runtime_error("[seq] Failed to load Z-Image text encoder part " +
+                               std::to_string(i + 1));
   }
   void loadCapPartAlone() {
     if (cap_part_) return;
