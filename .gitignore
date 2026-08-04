@@ -20,3 +20,7 @@ app/src/main/assets/qnnlibs
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Python environments created by tools/zimage/setup_qnn_env.sh (WORK defaults
+# to $PWD/.zimage-env). Build artifacts -- the script recreates them.
+.zimage-env/
