@@ -77,6 +77,19 @@ class BackendService : Service() {
         // reuse/latency, never correctness: a slower re-entry just starts fresh.
         private const val IDLE_GRACE_MS = 1500L
 
+        // The live instance, for the one caller that must act on a process
+        // which is alive but useless: a backend stuck thrashing never dies,
+        // and reconcile()'s alreadyServing check would keep it forever.
+        @Volatile
+        private var self: BackendService? = null
+
+        /** Force-restarts the current backend, keeping its config. No-op when
+         * nothing is running. Safe from any thread: the work runs on the
+         * service's own single backend thread. */
+        fun restartBackend() {
+            self?.let { svc -> svc.serviceScope.launch { svc.reconcile(true) } }
+        }
+
         const val ACTION_STOP = "io.github.xororz.localdream.STOP_GENERATION"
         const val ACTION_RESTART = "io.github.xororz.localdream.RESTART_BACKEND"
 
@@ -150,6 +163,7 @@ class BackendService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        self = this
         createNotificationChannel()
         serviceScope.launch { prepareRuntimeDir() }
     }
@@ -572,6 +586,15 @@ class BackendService : Service() {
             val systemLibPathsStr = systemLibPaths.joinToString(":")
             env["LD_LIBRARY_PATH"] = systemLibPathsStr
             env["DSP_LIBRARY_PATH"] = runtimeDir.absolutePath
+            if (config.backendType == "zimage") {
+                // Text-encoder contexts one at a time: 620 MB peak instead of
+                // six co-resident (3.7 GB), which put a 16 GB phone into swap
+                // thrash -- the backend does not die there, it grinds forever
+                // at "Loading text encoder 3/6", alive, so no closed socket
+                // and no error, ever. The watchdog now catches that state;
+                // not entering it is the actual fix.
+                env["LOCALDREAM_ZIMAGE_SEQ_CLIP"] = "1"
+            }
 
             Log.d(TAG, "COMMAND: ${command.joinToString(" ")}")
             Log.d(TAG, "DIR: $runtimeDir")
@@ -653,6 +676,7 @@ class BackendService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        if (self === this) self = null
         // The scope is never cancelled, so this job still runs after
         // onDestroy returns; closing the dispatcher afterwards lets its
         // thread wind down once the backend process has exited.

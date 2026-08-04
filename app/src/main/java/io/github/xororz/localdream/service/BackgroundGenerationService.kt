@@ -47,6 +47,10 @@ class BackgroundGenerationService : Service() {
         private const val CHANNEL_ID = "image_generation_channel"
         private const val NOTIFICATION_ID = 1
         const val ACTION_STOP = "stop_generation"
+
+        // Longest tolerated silence between SSE events before the backend is
+        // declared stalled. See the watchdog note at the request site.
+        private const val STALL_LIMIT_S = 300L
         const val LOCAL_BACKEND_HOST = "localhost:8081"
 
         // Shared across generations; the long timeouts cover a single SDXL
@@ -278,6 +282,9 @@ class BackgroundGenerationService : Service() {
         // Set once the complete event is fully handled; a socket teardown
         // racing the service shutdown after that point is not an error.
         var completed = false
+        // Last sub-step the backend reported; errors of every kind use it to
+        // say where things stopped.
+        var lastStage = ""
         try {
             updateState(GenerationState.Progress(0f))
 
@@ -323,10 +330,23 @@ class BackgroundGenerationService : Service() {
                 .post(jsonObject.toString().toRequestBody("application/json".toMediaTypeOrNull()))
                 .build()
 
-            // Outlives the response block so a broken stream can say where it
-            // broke.
-            var lastStage = ""
-            val call = generationClient.newCall(request)
+            // Watchdog. A backend that has run out of memory does not die --
+            // it thrashes: alive, making no progress, sending no bytes. On
+            // this side nothing would ever fire: the socket stays open so no
+            // exception, no event arrives so no state change, and the global
+            // read timeout is an hour. So cap the silence BETWEEN SSE events.
+            // The longest legitimate gap is one context-binary load (about a
+            // minute on a struggling phone); five minutes of nothing is stuck,
+            // not slow. Ultrafix keeps the long timeout -- its tiled decode is
+            // legitimately silent for minutes.
+            val client = if (ultrafix) {
+                generationClient
+            } else {
+                generationClient.newBuilder()
+                    .readTimeout(STALL_LIMIT_S, TimeUnit.SECONDS)
+                    .build()
+            }
+            val call = client.newCall(request)
             activeCall = call
             call.execute().use { response ->
                 if (!response.isSuccessful) {
@@ -608,6 +628,22 @@ class BackgroundGenerationService : Service() {
                 // read; this is the expected exit, not an error.
                 Log.d("GenerationService", "generation cancelled")
                 updateState(GenerationState.Idle)
+            } else if (e is java.net.SocketTimeoutException) {
+                // The watchdog fired: the backend is alive but has produced
+                // nothing for STALL_LIMIT_S. Force-restart it -- a thrashing
+                // process never recovers on its own, and it is holding the
+                // very memory that causes the thrash.
+                val tail = BackendService.logTail()
+                val where = if (lastStage.isNotEmpty()) " ($lastStage)" else ""
+                Log.e("GenerationService", "backend stalled$where")
+                BackendService.restartBackend()
+                updateState(
+                    GenerationState.Error(
+                        this@BackgroundGenerationService.getString(
+                            R.string.backend_stalled,
+                        ) + where + if (tail.isNotEmpty()) "\n\n$tail" else "",
+                    ),
+                )
             } else {
                 Log.e("GenerationService", "generation error", e)
                 val tail = BackendService.logTail()
