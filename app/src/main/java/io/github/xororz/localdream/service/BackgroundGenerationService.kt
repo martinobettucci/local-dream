@@ -585,12 +585,15 @@ class BackgroundGenerationService : Service() {
                 // Naming the stage is the whole diagnosis: "it broke" against
                 // "it broke loading text encoder part 3 of 6".
                 val where = if (lastStage.isNotEmpty()) " ($lastStage)" else ""
-                Log.e("BgGenService", "backend stream ended with no result$where")
+                // The backend's own last lines: without them a death here is
+                // indistinguishable from any other.
+                val tail = BackendService.logTail()
+                Log.e("BgGenService", "backend stream ended with no result$where\n$tail")
                 updateState(
                     GenerationState.Error(
                         this@BackgroundGenerationService.getString(
                             R.string.backend_stream_ended,
-                        ) + where,
+                        ) + where + if (tail.isNotEmpty()) "\n\n$tail" else "",
                     ),
                 )
                 stopSelf()
@@ -607,9 +610,12 @@ class BackgroundGenerationService : Service() {
                 updateState(GenerationState.Idle)
             } else {
                 Log.e("GenerationService", "generation error", e)
+                val tail = BackendService.logTail()
                 updateState(
                     GenerationState.Error(
-                        e.message ?: this@BackgroundGenerationService.getString(R.string.unknown_error),
+                        (e.message
+                            ?: this@BackgroundGenerationService.getString(R.string.unknown_error)) +
+                            if (tail.isNotEmpty()) "\n\n$tail" else "",
                     ),
                 )
             }

@@ -55,6 +55,14 @@ class BackendService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + backendDispatcher)
 
     companion object {
+        private const val LOG_TAIL_LINES = 40
+        private val recentLog = ArrayDeque<String>()
+
+        /** Last lines the backend printed, newest last. Empty if it never ran. */
+        fun logTail(maxLines: Int = 12): String = synchronized(recentLog) {
+            recentLog.takeLast(maxLines).joinToString("\n")
+        }
+
         private const val TAG = "BackendService"
         private const val EXECUTABLE_NAME = "libstable_diffusion_core.so"
         private const val RUNTIME_DIR = "runtime_libs"
@@ -589,6 +597,18 @@ class BackendService : Service() {
         }
     }
 
+    // The backend's own last words. When it dies the app sees only a closed
+    // socket, and "please send me logcat" is not a diagnosis path for someone
+    // holding a phone -- so keep a small tail and put it in the error the user
+    // actually reads. The monitor thread writes it, the generation coroutine
+    // reads it.
+    private fun rememberLogLine(line: String) {
+        synchronized(recentLog) {
+            recentLog.addLast(line)
+            while (recentLog.size > LOG_TAIL_LINES) recentLog.removeFirst()
+        }
+    }
+
     private fun startMonitorThread(proc: Process) {
         Thread {
             val exitCode = try {
@@ -596,6 +616,7 @@ class BackendService : Service() {
                     var line: String?
                     while (reader.readLine().also { line = it } != null) {
                         Log.i(TAG, "Backend: $line")
+                        line?.let { rememberLogLine(it) }
                     }
                 }
                 proc.waitFor()
