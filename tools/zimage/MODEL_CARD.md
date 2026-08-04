@@ -46,8 +46,8 @@ A conversion of [Tongyi-MAI/Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-I
 of Local Dream with `--type zimage` support compiled in — the stock releases do
 not have it, so the weights below need this build (or your own from source).
 
-Note the APK in this repo predates the 33-graph DiT split; it will not load
-this model. A rebuilt one replaces it.
+It is built from `claude/zimage-q2-runner-ftk3lo`, against the 33-graph DiT
+below — an older build will not load this model.
 
 It is a **debug** build: installable and signed with the standard Android debug
 key, so it coexists with a Play/release install rather than upgrading it.
