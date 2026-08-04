@@ -28,7 +28,7 @@ library_name: local-dream
 > | Graphs accepted by `qairt-converter` | ✅ |
 > | Quantization error after w4a16 | ❌ never measured |
 > | Runs on an NPU at all | ❌ never attempted |
-| Whether 8 Gen 2 (v73) has the headroom for a 6B DiT | ❌ unknown |
+> | Whether 8 Gen 2 (v73) has the headroom for a 6B DiT | ❌ unknown |
 > | Output image quality | ❌ unknown |
 >
 > If it does not work, that is expected rather than surprising. Please open an
@@ -45,6 +45,9 @@ A conversion of [Tongyi-MAI/Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-I
 `LocalDream-zimage-2.8.1-arm64-v8a-UNTESTED-debug.apk` in this repo is a build
 of Local Dream with `--type zimage` support compiled in — the stock releases do
 not have it, so the weights below need this build (or your own from source).
+
+Note the APK in this repo predates the 33-graph DiT split; it will not load
+this model. A rebuilt one replaces it.
 
 It is a **debug** build: installable and signed with the standard Android debug
 key, so it coexists with a Play/release install rather than upgrading it.
@@ -65,36 +68,66 @@ Z-Image.
 
 ## Install
 
-Download and unzip into the app's model directory, or use the in-app download.
-The archive unpacks to the model directory root — not into a subfolder.
+Use the in-app download, which reads `model/manifest.json` and fetches the 45
+files listed there. There is no archive: at 17.6 GB the device would need the
+zip *and* its extraction free at the same time, and a dropped connection would
+cost the whole download instead of one file. The manifest form resumes at file
+granularity.
 
-## `partial/` — conversion in progress
+To install by hand, put everything under `model/` into one model directory.
 
-`partial/` holds pieces that have been converted but do not yet add up to a
-runnable model. **It is not installable.** Each file is uploaded the moment it
-is built, because the conversion runs on ephemeral machines with less free disk
-than the finished model needs — publishing every piece immediately is what stops
-a reclaimed container from costing the whole run.
+## `partial/` — the pieces as they were built
 
-`partial/stats/partN.tsv` records peak RSS and wall clock per stage
+`partial/` holds the conversion's own output, before assembly. `model/` is
+built from it by server-side copy, so the two are the same bytes. Each file
+lands in `partial/` the moment it is built, because the conversion runs on
+ephemeral machines with less free disk than the finished model needs —
+publishing every piece immediately is what stops a reclaimed container from
+costing the whole run.
+
+`partial/n32/stats/*.tsv` records peak RSS and wall clock per stage
 (`stage`, `peak_rss_kb`, `seconds`, `exit_code`) for the machine that built each
-part. That is what the split count is chosen from: `qairt-quantizer` holds a
-whole part plus a calibration sample's activations, and fewer blocks per part is
-the only lever on it.
+graph. That is what the split is chosen from, and it is worth reading, because
+the split is not arbitrary — see below.
 
-When `partial/` is complete it is repackaged as the archive above and this
-section goes away.
-
-## What is in the archive
+## What is in the model
 
 | File | What it is |
 |---|---|
 | `tokenizer.json` | Qwen2Tokenizer |
 | `token_emb.bin` | fp16 `[vocab, 2560]` token embeddings; the lookup runs on CPU so prompt weighting can scale rows |
-| `clip.bin` | Qwen3-4B text encoder, tapped at `hidden_states[-2]` |
-| `unet_part1..N.bin` | the S3-DiT, split across contexts (6B does not fit one) |
+| `clip_part1..6.bin` | Qwen3-4B text encoder, tapped at `hidden_states[-2]`, split across 6 contexts |
+| `unet_cap.bin` | the DiT's caption branch: `cap_embedder` + `context_refiner` |
+| `unet_part1..32.bin` | the rest of the S3-DiT, split across 32 contexts |
 | `vae_decoder.bin` / `vae_encoder.bin` | Flux AutoencoderKL, 16 latent channels |
 | `config.json` | 8 steps, cfg 1.0, euler |
+
+Total 17.6 GB: 12.9 GB of DiT, 3.6 GB of text encoder, 0.8 GB of token
+embeddings, 0.3 GB of VAE.
+
+## Why 33 DiT graphs
+
+Because that is what fits. The context-binary generator's peak RSS, measured on
+a 16 GB machine:
+
+| graph | peak RSS | outcome |
+|---|---|---|
+| one transformer block, 4608 tokens | 11.1 GB | builds |
+| 2 refiner blocks + a transformer block | >21 GB | OOM at quantize |
+| 2 refiner blocks alone | 15.97 GB | OOM at context binary |
+| caption branch (2 blocks, 512 tokens) | 6.6 GB | builds, 7 min |
+| 1 refiner block (what ships) | 15.1 GB | builds, 40 min |
+
+A 4096-token noise-refiner block costs ~4.7 GB at that stage — 4096² scores
+over 30 heads — so one per graph is the only arrangement that works. The
+caption branch is separate for the same reason, and the cut follows the model:
+the caption path and the image path exchange nothing until the concatenation
+that forms the residual stream, so splitting them changes no arithmetic. It is
+verified bit-exact against the reference.
+
+That one also earns something at run time. The caption branch is the only piece
+of the DiT that does not depend on the timestep, so the runner computes it once
+per prompt rather than once per step.
 
 ## Generation settings
 

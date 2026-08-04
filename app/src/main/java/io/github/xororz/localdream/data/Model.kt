@@ -633,7 +633,11 @@ class ModelRepository private constructor(private val context: Context) {
             baseUrl = baseUrl,
             fileUri = fileUri,
             generationSize = 1024,
-            approximateSize = "5.8GB",
+            // Measured from the published manifest, not estimated: 45 files.
+            // The DiT is 12.9 GB across 33 contexts, the Qwen3-4B encoder
+            // 3.6 GB across 6, plus a 778 MB fp16 token-embedding table the
+            // CPU indexes and 341 MB of VAE.
+            approximateSize = "17.6GB",
             isDownloaded = isDownloaded,
             needsUpgrade = needsUpgrade,
             // Unlike the other distilled models here, these are set in code

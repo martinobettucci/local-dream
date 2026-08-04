@@ -90,7 +90,7 @@ Everything goes in one model directory under the app's `models/`:
   unet_cap.bin        # QNN context binary: the DiT's caption branch
   unet_part1.bin      # QNN context binaries: the S3-DiT, cut into N pieces
   unet_part2.bin      #   numbered from 1, contiguous, N discovered on disk
-  ...
+  ...                 #   (N = 32 in the published build)
   vae_decoder.bin     # QNN context binary
   vae_encoder.bin     # optional; enables img2img / inpaint / aspect ratios
   config.json         # optional defaults (see below)
@@ -147,7 +147,7 @@ than paid on every step.
 | in | `attention_mask` | `[1, S]` (1.0 = real token, 0.0 = pad) |
 | out | `hidden` | `[1, S, D]` (or `context`, if it is also the last part) |
 
-**Every later part**
+**Every part after that**
 
 | | name | shape |
 |---|---|---|
@@ -218,26 +218,55 @@ afterwards, never the reverse: QNN lowers a slice of a boolean tensor to
 `StridedSlice` on `Bool_8`, which the HTP rejects — and only says so at
 context-binary generation, an hour in.
 
-**Part 1**
+**Part 1** — `all_x_embedder` + `t_embedder` + `noise_refiner[0]`
 
 | | name | shape |
 |---|---|---|
 | in | `sample` | `[1, C, H, W]` |
 | in | `timestep` | `[1]` — this is `sigma * 1000`, not sigma |
-| in | `cap` | `[1, S, 3840]` — the caption branch's output |
 | in | `pos_ids` | `[1, T, 3]` int32 — 3D RoPE coordinates `(t, h, w)` |
-| in | `attn_mask` | `[1, T]` — **only if part 1 owns transformer blocks** |
-| out | `hidden` | `[1, T, 3840]` — the fused image+caption token stream |
+| out | `hidden` | `[1, n_img, 3840]` — the IMAGE stream, caption not yet joined |
 | out | `emb` | `[1, 256]` — the timestep adaLN vector (see below) |
 
-Part 1 is `all_x_embedder` + `t_embedder` + `noise_refiner`, then
-`cat([x, cap], dim=1)`. In the shipped 31-way split it owns no transformer
-block at all, which is why it declares no `attn_mask`: with the caption refiner
-gone there is nothing left in it for the mask to feed, and the converter drops
-inputs no operation reads. The runner binds the mask by presence rather than by
-assumption, so a coarser split whose part 1 does own blocks still works.
+**Part 2** — `noise_refiner[1]`, then the concatenation
 
-**Every later part**
+| | name | shape |
+|---|---|---|
+| in | `hidden_in` | `[1, n_img, 3840]` |
+| in | `emb` | `[1, 256]` |
+| in | `cap` | `[1, S, 3840]` — the caption branch's output |
+| in | `pos_ids` | `[1, T, 3]` int32 |
+| out | `hidden` | `[1, T, 3840]` — the fused image+caption token stream |
+
+The head of the model is two graphs, not one, and that is forced. A graph
+holding one 4096-token noise-refiner block peaks at ~15.1 GB in
+`qnn-context-binary-generator`; two of them peak at 15.97 GB, which is an OOM
+kill on a 16 GB machine — measured twice, once with the caption refiner in the
+same graph and once without. A refiner block costs ~4.7 GB there, being 4096²
+attention scores over 30 heads, so one per graph is the only arrangement that
+fits.
+
+Neither head graph declares `attn_mask`: the noise refiner is unmasked in the
+reference, every image token being real, so there is nothing for the mask to
+feed. Part 1 declares no `cap` either. Which graph declares what follows from
+what it reads:
+
+| input | present on |
+|---|---|
+| `pos_ids` | every graph running a refiner or transformer block |
+| `attn_mask` | graphs running transformer blocks |
+| `cap` | whichever graph performs the concatenation |
+
+The converter drops an input no operation reads, so a graph declaring one it
+does not use would simply not have it, and the app — which binds by name —
+would fail on device. So the runner binds `cap` and `attn_mask` by presence,
+and `dit_input_names` plus `check_io_names` hold the contract on the export
+side. This is not hypothetical: an intermediate split produced a graph whose
+only job was the concatenation, and it lost `pos_ids` and then `emb` exactly
+this way. Such a graph is now rejected at construction — the work it does is a
+memcpy, not a context binary.
+
+**Every part after that**
 
 | | name | shape |
 |---|---|---|
@@ -247,6 +276,9 @@ assumption, so a coarser split whose part 1 does own blocks still works.
 | in | `attn_mask` | `[1, T]` |
 | out | `hidden` | `[1, T, 3840]` (non-terminal parts) |
 | out | `out_sample` | `[1, C, H, W]` (terminal part only) |
+
+One transformer block each in the published build, so parts 3..32 carry blocks
+0..29.
 
 **The two masks are the whole ballgame.** A static graph fixes the caption at
 `S = 512` slots; the reference feeds a variable-length caption padded only to a
@@ -279,6 +311,23 @@ Qwen tokens, with no quality penalty for short prompts.
 
 Later parts take no `timestep`: `emb` already is the timestep's adaLN vector,
 computed once by part 1 and reused by every block.
+
+### Measured cost of every graph
+
+Peak RSS and wall clock per stage, from `partial/n32/stats/*.tsv`. This is what
+the split was chosen from, and the only reason the model exists in this shape.
+
+| graph | export | convert | quantize | context binary | binary |
+|---|---|---|---|---|---|
+| caption branch | 6.6 GB / 190 s | 3.4 GB / 129 s | 5.2 GB / 53 s | 2.9 GB / 53 s | 374 MB |
+| part 1 (embed + refiner 0) | 7.4 GB / 75 s | 2.0 GB / 18 s | 7.4 GB / 55 s | 15.1 GB / 2373 s | 489 MB |
+| part 2 (refiner 1 + concat) | 7.4 GB / 82 s | 2.0 GB / 28 s | 7.5 GB / 56 s | 15.2 GB / 2511 s | 481 MB |
+| one transformer block | 8.1 GB / 53 s | 2.0 GB / 20 s | 11.2 GB / 57 s | 11.1 GB / 2260 s | 386 MB |
+
+The context-binary stage dominates both time and memory, and it is the stage
+that fails: it is reached only after convert and quantize have both spent
+minutes succeeding. The caption branch is cheap on every axis for one reason —
+it runs over 512 tokens rather than 4096.
 
 `emb` is **256 wide, not `dim`**. `TimestepEmbedder` runs 256 -> 1024 -> 256
 while the residual stream is 3840, and every block's `adaLN_modulation` consumes
