@@ -1289,6 +1289,22 @@ fun ModelRunScreen(
         }
     }
 
+    // Declares the local backend target; BackendService reconciles idempotently
+    // (keeps a live process serving the same config, restarts a dead or
+    // mismatched one). Callable from entry AND from the generate tap, because
+    // the process can die between the two -- an OOM kill mid-generation leaves
+    // it dead with nothing ever re-sending the start command.
+    fun requestLocalBackendStart() {
+        val intent = Intent(context, BackendService::class.java).apply {
+            putExtra("modelId", model?.id)
+            putExtra("backendType", model?.backendType)
+            putExtra("width", currentWidth)
+            putExtra("height", currentHeight)
+            putExtra("use_opencl", useOpenCL)
+        }
+        context.startForegroundService(intent)
+    }
+
     LaunchedEffect(hasInitialized) {
         if (hasInitialized) {
             if (isRemote) {
@@ -1305,18 +1321,10 @@ fun ModelRunScreen(
                     errorMessage = msgRemoteSelectFailed
                 }
             } else {
-                // Always declare the target; BackendService reconciles idempotently
-                // (reuses a live process for the same model, restarts otherwise).
-                // Reading the shared backendState here to decide would race with the
-                // previous screen's still-pending stop and could skip the start.
-                val intent = Intent(context, BackendService::class.java).apply {
-                    putExtra("modelId", model?.id)
-                    putExtra("backendType", model?.backendType)
-                    putExtra("width", currentWidth)
-                    putExtra("height", currentHeight)
-                    putExtra("use_opencl", useOpenCL)
-                }
-                context.startForegroundService(intent)
+                // Reading the shared backendState here to decide would race with
+                // the previous screen's still-pending stop and could skip the
+                // start; declaring unconditionally cannot.
+                requestLocalBackendStart()
             }
         }
     }
@@ -1707,10 +1715,31 @@ fun ModelRunScreen(
                 },
                 onUnhealthy = {
                     isCheckingBackend = false
-                    errorMessage = msgBackendFailed
+                    // The backend's own last lines beat "maybe your device is
+                    // not supported": the usual cause here is a process that
+                    // died, not an unsupported SoC.
+                    val tail = BackendService.logTail()
+                    errorMessage = msgBackendFailed +
+                        if (tail.isNotEmpty()) "\n\n$tail" else ""
                 },
             )
         }
+    }
+
+    // Generate-tap gate. The backend that was healthy at screen entry can be
+    // dead by now: the OOM killer takes it mid-load, the monitor thread parks
+    // BackendService in Error, and nothing re-runs reconcile() -- so every
+    // later tap used to slam into a closed port ("failed to connect to
+    // /127.0.0.1:8081") with no way out short of leaving the screen. Redeclare
+    // the target (a no-op on a live process), then hold the POST until /health
+    // answers: a dead backend now costs one restart instead of a brick.
+    suspend fun ensureBackendAlive(): Boolean {
+        if (isRemote) return true
+        requestLocalBackendStart()
+        isCheckingBackend = true
+        backendReady = false
+        awaitBackendReady()
+        return backendReady
     }
 
     // Remote mode starts its health check only after /select has been sent
@@ -1982,6 +2011,13 @@ fun ModelRunScreen(
                                 batchGenerationJob = coroutineScope.launch {
                                     for (i in 0 until actualBatchCount) {
                                         currentBatchIndex = i + 1
+                                        // Restart a dead backend rather than
+                                        // POST into a closed port; on failure
+                                        // errorMessage already says why.
+                                        if (!ensureBackendAlive()) {
+                                            currentBatchIndex = 0
+                                            return@launch
+                                        }
                                         Log.d(
                                             "ModelRunScreen",
                                             "preparing batch $i",
