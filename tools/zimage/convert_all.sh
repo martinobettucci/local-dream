@@ -14,7 +14,7 @@
 #   PY=... QNN=... ./convert_all.sh <work_dir> <n_parts> [bits] [dsp_arch]
 #
 # n_parts is the RAM lever — see the note in convert_part.sh. Peak RSS per
-# stage lands in <work_dir>/stats/partN.tsv and is summarised at the end.
+# stage lands in <work_dir>/stats/unet_partN.tsv and is summarised at the end.
 set -euo pipefail
 
 W="${1:?work dir}"; NPARTS="${2:?number of parts}"
@@ -42,35 +42,38 @@ echo "==> $NPARTS parts, w${WBITS}a16, Hexagon $ARCH -> $HF_REPO/$REMOTE_DIR"
 # point, and re-asking after every upload would only ever confirm what we just
 # did.
 DONE="$("$PY" "$HERE/upload_hf.py" --repo "$HF_REPO" --list-remote "$REMOTE_DIR/" 2>/dev/null || true)"
-echo "==> already on the Hub: $(echo "$DONE" | grep -c 'unet_part' || true) parts"
+echo "==> already on the Hub: $(echo "$DONE" | grep -c 'unet_' || true) graphs"
 
-# Part order, not part range. Part 1 is not like the others: it carries both
-# refiner stacks and every embedder on top of its own block, which is 3.63 GB of
-# fp32 against ~0.72 GB for a middle part -- five times the weights, five times
-# the ONNX, and an export that peaks near the RAM ceiling. Doing it last means
-# it runs when every other part has been uploaded and deleted, so it gets the
-# whole disk and the whole machine instead of competing with 29 siblings.
-ORDER="${ORDER:-$(seq 2 "$NPARTS"; echo 1)}"
+# Build order, not part range. "cap" is the caption branch, which is a graph of
+# its own rather than a numbered part (see CAP_INPUT_NAMES in static_export.py).
+#
+# Part 1 goes last. It is not like the others: it carries the image embedder and
+# the whole noise refiner on top of whatever blocks it owns, so its export and
+# its context binary both peak far above a middle part's. Doing it last means it
+# runs when every other part has been uploaded and deleted, so it gets the whole
+# disk and the whole machine instead of competing with its siblings.
+ORDER="${ORDER:-cap $(seq 2 "$NPARTS"; echo 1)}"
 
 for N in $ORDER; do
-  if echo "$DONE" | grep -qx "$REMOTE_DIR/unet_part$N.bin"; then
-    echo "==> part$N already published, skipping"
+  if [ "$N" = cap ]; then STEM="unet_cap"; else STEM="unet_part$N"; fi
+  if echo "$DONE" | grep -qx "$REMOTE_DIR/$STEM.bin"; then
+    echo "==> $STEM already published, skipping"
     continue
   fi
-  echo "==> part$N of $NPARTS (free $(free_gb)G)"
+  echo "==> $STEM of $NPARTS (free $(free_gb)G)"
   PY="$PY" QNN="$QNN" "$HERE/convert_part.sh" "$W" "$N" "$NPARTS" "$WBITS" "$ARCH"
 
   "$PY" "$HERE/upload_hf.py" --repo "$HF_REPO" \
-      --put "$W/out/unet_part$N.bin" --as "$REMOTE_DIR/unet_part$N.bin"
+      --put "$W/out/$STEM.bin" --as "$REMOTE_DIR/$STEM.bin"
   # Uploaded means committed. Keeping it costs the disk the next part needs.
-  [ "$KEEP_LOCAL" = 1 ] || rm -f "$W/out/unet_part$N.bin"
+  [ "$KEEP_LOCAL" = 1 ] || rm -f "$W/out/$STEM.bin"
   "$PY" "$HERE/upload_hf.py" --repo "$HF_REPO" \
-      --put "$W/stats/part$N.tsv" --as "$REMOTE_DIR/stats/part$N.tsv" || true
+      --put "$W/stats/$STEM.tsv" --as "$REMOTE_DIR/stats/$STEM.tsv" || true
 done
 
 echo
 echo "==> peak RSS by stage (MB), across all parts built on this machine"
 awk -F'\t' '{ if ($2 > peak[$1]) peak[$1] = $2; secs[$1] += $3 }
      END { for (s in peak) printf "  %-9s %6d MB   %5d s total\n", s, peak[s]/1024, secs[s] }' \
-    "$W"/stats/part*.tsv 2>/dev/null | sort || echo "  (no parts built this run)"
+    "$W"/stats/unet_*.tsv 2>/dev/null | sort || echo "  (no parts built this run)"
 echo "==> https://huggingface.co/$HF_REPO/tree/main/$REMOTE_DIR"

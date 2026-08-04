@@ -78,6 +78,12 @@ def main():
     dit_prefix = f"partial/{dit_dirs[0]}"
     dit_parts = collect(names, dit_prefix, "unet_part",
                         int(dit_dirs[0][1:]), "DiT")
+    # The caption branch is a graph of its own, not a numbered part, and the
+    # backend fails without it -- so it is checked here rather than assumed.
+    cap = f"{dit_prefix}/unet_cap.bin"
+    if cap not in names:
+        raise SystemExit(f"{cap} missing (the DiT's caption branch)")
+    dit_parts.append(cap)
 
     plan = [(src, src.rsplit("/", 1)[1]) for src in dit_parts]
 

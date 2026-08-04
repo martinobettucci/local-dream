@@ -16,7 +16,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from export_dit import N_LAYERS, plan_parts, target_part  # noqa: E402
+from export_dit import (CAP_PART, N_LAYERS, plan_parts,  # noqa: E402
+                        target_part)
 
 
 def check_plans(counts):
@@ -25,16 +26,20 @@ def check_plans(counts):
         cuts = plan_parts(n)
         blocks = [b for a, bb in cuts for b in range(a, bb)]
         problems = []
+        # n = N_LAYERS + 1 is the block-less-part-1 plan the shipped build uses;
+        # there, and only there, one part legitimately owns no block.
+        blockless_ok = n == N_LAYERS + 1
         if len(cuts) != n:
             problems.append(f"{len(cuts)} parts, wanted {n}")
         if sorted(blocks) != list(range(N_LAYERS)):
             problems.append("blocks are not exactly 0..N-1 once each")
-        if any(bb <= a for a, bb in cuts):
-            problems.append("empty part")
+        empty_at = [i for i, (a, bb) in enumerate(cuts) if bb <= a]
+        if empty_at and not (blockless_ok and empty_at == [0]):
+            problems.append(f"empty part(s) at {[i + 1 for i in empty_at]}")
         if any(cuts[i][1] != cuts[i + 1][0] for i in range(len(cuts) - 1)):
             problems.append("not contiguous")
         sizes = sorted({bb - a for a, bb in cuts})
-        if len(sizes) > 2:
+        if len(sizes) > (3 if blockless_ok else 2):
             problems.append(f"block counts vary too much: {sizes}")
         if problems:
             ok = False
@@ -64,6 +69,8 @@ def check_routing(counts):
             pi, new = target_part(name, cuts)
             per_part.setdefault(pi, set()).add(new)
             placed += 1
+            if pi == CAP_PART:
+                continue
             if new.startswith("layers."):
                 idx = int(new.split(".")[1])
                 span = cuts[pi][1] - cuts[pi][0]
@@ -75,9 +82,13 @@ def check_routing(counts):
         if empty:
             ok = False
             print(f"  n={n} FAIL parts with no tensors: {empty}")
+        elif CAP_PART not in per_part:
+            ok = False
+            print(f"  n={n} FAIL no tensor routed to the caption branch")
         elif placed == len(weight_map):
             print(f"  n={n:2d} routing ok, {placed}/{len(weight_map)} tensors, "
-                  f"all {n} parts non-empty")
+                  f"all {n} parts non-empty, "
+                  f"{len(per_part[CAP_PART])} on the caption branch")
     return ok
 
 
@@ -88,12 +99,12 @@ def main():
                          "(reads one index file from the Hub)")
     args = ap.parse_args()
 
-    counts = list(range(1, N_LAYERS + 1))
-    print(f"planning, n = 1..{N_LAYERS}")
+    counts = list(range(1, N_LAYERS + 2))
+    print(f"planning, n = 1..{N_LAYERS + 1}")
     ok = check_plans(counts)
     if args.remote:
         print("\nrouting real tensors")
-        ok = check_routing([1, 8, 15, 16, 29, 30]) and ok
+        ok = check_routing([1, 8, 15, 16, 29, 30, 31]) and ok
 
     print("\n" + ("ALL CHECKS PASSED" if ok else "FAILED"))
     return 0 if ok else 1

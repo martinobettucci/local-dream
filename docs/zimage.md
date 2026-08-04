@@ -87,6 +87,7 @@ Everything goes in one model directory under the app's `models/`:
   clip_part1.bin      # QNN context binaries: Qwen3-4B text encoder, cut into
   clip_part2.bin      #   M pieces, numbered from 1, M discovered on disk.
   ...                 #   A single clip.bin is still accepted (the M = 1 case).
+  unet_cap.bin        # QNN context binary: the DiT's caption branch
   unet_part1.bin      # QNN context binaries: the S3-DiT, cut into N pieces
   unet_part2.bin      #   numbered from 1, contiguous, N discovered on disk
   ...
@@ -175,14 +176,47 @@ with `<|endoftext|>` (151643) and marks the padding in `attention_mask`. Build
 the graph's causal mask from `attention_mask` — do not assume a fixed prompt
 length.
 
-### `unet_part1.bin` … `unet_partN.bin` — the S3-DiT
+### `unet_cap.bin`, `unet_part1.bin` … `unet_partN.bin` — the S3-DiT
 
-The DiT is cut between transformer blocks. The chain is uniform:
+The DiT is cut between transformer blocks, plus once along its own branch
+structure. The chain is uniform:
 
 `T` is the unified sequence length: `(H/2)·(W/2)` **image tokens first**,
 then `S` caption slots — 4096 + 512 = 4608 at 1024x1024. The order is image
 then caption; diffusers' basic mode builds `[x, cap]`, and getting this
 backwards is silent.
+
+**The caption branch** (`unet_cap.bin`)
+
+| | name | shape |
+|---|---|---|
+| in | `context` | `[1, S, D]` — the text encoder's hidden states |
+| in | `pos_ids` | `[1, T, 3]` int32 — the WHOLE sequence; sliced in-graph |
+| in | `attn_mask` | `[1, T]` — likewise |
+| in | `cap_pad_mask` | `[1, S]` — 1 where a caption row becomes the pad token |
+| out | `cap` | `[1, S, 3840]` — refined caption tokens |
+
+This is `cap_embedder` + `context_refiner`, which used to live inside part 1.
+It is separate for one reason: part 1 with both embedders and both refiner
+stacks needed 15.9 GB of peak RSS at `qnn-context-binary-generator`, against
+11.3 GB for a one-block part, and no 16 GB machine survives that. The cut
+follows the model rather than cutting across it — the caption path and the
+image path exchange nothing until the concatenation that forms the residual
+stream — so it changes no arithmetic.
+
+It also pays for itself at run time. This is the only piece of the DiT that
+does not depend on the timestep, so the runner computes it **once per prompt**
+rather than once per step: at cfg 1.0 and 8 steps that is two of the model's 34
+blocks running once instead of eight times. The runner caches the result
+against the graph's own inputs (`context` and `cap_pad_mask`, compared byte for
+byte) rather than against a "prompt changed" flag.
+
+`pos_ids` and `attn_mask` cover the whole sequence, not just the caption slots,
+so the runner builds one set of coordinates and hands the same two buffers to
+every graph. The slice happens in-graph. Slice the **float** mask and compare
+afterwards, never the reverse: QNN lowers a slice of a boolean tensor to
+`StridedSlice` on `Bool_8`, which the HTP rejects — and only says so at
+context-binary generation, an hour in.
 
 **Part 1**
 
@@ -190,12 +224,18 @@ backwards is silent.
 |---|---|---|
 | in | `sample` | `[1, C, H, W]` |
 | in | `timestep` | `[1]` — this is `sigma * 1000`, not sigma |
-| in | `context` | `[1, S, D]` |
+| in | `cap` | `[1, S, 3840]` — the caption branch's output |
 | in | `pos_ids` | `[1, T, 3]` int32 — 3D RoPE coordinates `(t, h, w)` |
-| in | `attn_mask` | `[1, T]` — 1 up to `cap_len`, 0 beyond |
-| in | `cap_pad_mask` | `[1, S]` — 1 where a caption row becomes the pad token |
+| in | `attn_mask` | `[1, T]` — **only if part 1 owns transformer blocks** |
 | out | `hidden` | `[1, T, 3840]` — the fused image+caption token stream |
 | out | `emb` | `[1, 256]` — the timestep adaLN vector (see below) |
+
+Part 1 is `all_x_embedder` + `t_embedder` + `noise_refiner`, then
+`cat([x, cap], dim=1)`. In the shipped 31-way split it owns no transformer
+block at all, which is why it declares no `attn_mask`: with the caption refiner
+gone there is nothing left in it for the mask to feed, and the converter drops
+inputs no operation reads. The runner binds the mask by presence rather than by
+assumption, so a coarser split whose part 1 does own blocks still works.
 
 **Every later part**
 
@@ -213,7 +253,8 @@ backwards is silent.
 multiple of 32. They agree **bit-exactly** anyway — but only if the graph
 applies `attn_mask` in *both* of the places the reference gets away without one:
 
-1. the caption refiner (`context_refiner` self-attention), and
+1. the caption refiner (`context_refiner` self-attention, now `unet_cap.bin`),
+   and
 2. the main transformer blocks.
 
 Apply it only in (2) and a 12-token prompt lands ~3.6 % off; apply it in
@@ -259,8 +300,9 @@ Rules the runner enforces:
   RoPE cos/sin inside each part by gathering the baked tables with `pos_ids`;
   the Anima split found that passing large precomputed adaLN/RoPE tensors as
   flat graph inputs forces the residual stream into a slow HTP layout.
-- Because the stream is single-stream, `context` is **not** an input past part 1
-  — the caption tokens are already inside `hidden`.
+- Because the stream is single-stream, `context` is **not** an input to any
+  numbered part — the caption branch consumes it, and past part 1 the caption
+  tokens are already inside `hidden`.
 - Handoff shapes are checked against the graph's declared tensor sizes at run
   time; a mismatch is reported rather than memcpy'd.
 

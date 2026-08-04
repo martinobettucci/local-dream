@@ -60,12 +60,13 @@ class PipelineZImage : public PipelineQnn {
   PipelineZImage(TextEncoder &text_encoder, const std::string &model_dir,
                  std::vector<std::string> clip_part_paths,
                  std::vector<std::string> dit_part_paths,
-                 std::string vae_decoder_path, std::string vae_encoder_path,
-                 bool lowram, bool seq_dit)
+                 std::string cap_part_path, std::string vae_decoder_path,
+                 std::string vae_encoder_path, bool lowram, bool seq_dit)
       : PipelineQnn(text_encoder, model_dir, /*sdxl=*/false,
                     /*use_v_pred=*/false),
         clip_part_paths_(std::move(clip_part_paths)),
         dit_part_paths_(std::move(dit_part_paths)),
+        cap_part_path_(std::move(cap_part_path)),
         vae_decoder_path_(std::move(vae_decoder_path)),
         vae_encoder_path_(std::move(vae_encoder_path)),
         lowram_(lowram),
@@ -74,6 +75,8 @@ class PipelineZImage : public PipelineQnn {
         seq_dit_(lowram && seq_dit) {
     if (dit_part_paths_.empty())
       throw std::runtime_error("zimage: no DiT part binaries given");
+    if (cap_part_path_.empty())
+      throw std::runtime_error("zimage: no DiT caption branch binary given");
     if (clip_part_paths_.empty())
       throw std::runtime_error("zimage: no text encoder binaries given");
     dit_parts_.resize(dit_part_paths_.size());
@@ -109,6 +112,11 @@ class PipelineZImage : public PipelineQnn {
         QNN_ERROR("Failed to create Z-Image DiT part %zu.", i + 1);
         return false;
       }
+    }
+    cap_part_ = qnn_runtime::createModel(cap_part_path_, "unet_cap");
+    if (!cap_part_) {
+      QNN_ERROR("Failed to create the Z-Image DiT caption branch.");
+      return false;
     }
     if (!vae_encoder_path_.empty()) {
       vae_encoder_ = qnn_runtime::createModel(vae_encoder_path_, "vae_encoder");
@@ -148,6 +156,9 @@ class PipelineZImage : public PipelineQnn {
           EXIT_SUCCESS)
         return false;
     }
+    cap_part_->setSpillFillGroup(sf_bytes, head);
+    if (qnn_runtime::initializeApp("unet_cap", cap_part_) != EXIT_SUCCESS)
+      return false;
     if (vae_encoder_) {
       vae_encoder_->setSpillFillGroup(sf_bytes, head);
       if (qnn_runtime::initializeApp("VAEEncoder", vae_encoder_) !=
@@ -354,13 +365,57 @@ class PipelineZImage : public PipelineQnn {
     }
   }
 
-  // One full pass of the DiT for a single CFG branch: part 1 folds the caption
-  // and the noised latent into the residual stream, each later part advances
-  // it, and the terminal part emits the flow velocity.
+  // Refines the caption tokens, unless the last run already did it for this
+  // prompt. Nothing in this graph depends on the timestep, so at cfg 1.0 --
+  // the setting Turbo is distilled for -- it runs once for the whole
+  // generation instead of once per step.
+  //
+  // The cache key is the graph's own inputs, compared byte for byte, rather
+  // than a "has the prompt changed" flag. The pipeline object outlives a
+  // generation, and a flag that is right for every path through generate()
+  // today is one edit away from silently reusing another prompt's caption.
+  // cap_pad_mask determines the true prompt length, which is what selects the
+  // caption slice of pos_ids and attn_mask, so those need no separate key.
+  // The comparison is ~5 MB against a step measured in seconds.
+  void ensureCaption(const float *context) {
+    const size_t ctx_n =
+        (size_t)zimage_text_seq_len * zimage_text_embedding_size;
+    const size_t pad_n = (size_t)zimage_text_seq_len;
+    const bool hit =
+        !cap_.empty() && cap_key_.size() == ctx_n + pad_n &&
+        memcmp(cap_key_.data(), context, ctx_n * sizeof(float)) == 0 &&
+        memcmp(cap_key_.data() + ctx_n, cap_pad_mask_.data(),
+               pad_n * sizeof(float)) == 0;
+    if (hit) return;
+
+    if (seq_dit_) loadCapPartAlone();
+    if (!cap_part_)
+      throw std::runtime_error("Z-Image DiT caption branch not loaded");
+    const StatusCode st = cap_part_->executeZImageDitCaption(
+        context, pos_ids_.data(), attn_mask_.data(), cap_pad_mask_.data(),
+        (size_t)totalTokens(), cap_);
+    if (seq_dit_) cap_part_.reset();
+    if (st != StatusCode::SUCCESS) {
+      // Leave no half-valid cache behind: cap_ may hold the previous prompt's
+      // result, and the key must never outlive the value it describes.
+      cap_key_.clear();
+      throw std::runtime_error("Z-Image DiT caption branch failed");
+    }
+
+    cap_key_.resize(ctx_n + pad_n);
+    std::copy(context, context + ctx_n, cap_key_.begin());
+    std::copy(cap_pad_mask_.begin(), cap_pad_mask_.end(),
+              cap_key_.begin() + ctx_n);
+  }
+
+  // One full pass of the DiT for a single CFG branch: the caption branch and
+  // part 1 fold the prompt and the noised latent into the residual stream,
+  // each later part advances it, and the terminal part emits the flow velocity.
   void runDitChain(const float *sample, float timestep, const float *context,
                    const float *mask, float *out) {
     if (!mask) throw std::runtime_error("Z-Image conditioning has no mask");
     buildPositions(mask, pos_ids_, attn_mask_, cap_pad_mask_);
+    ensureCaption(context);
     const size_t tokens = (size_t)totalTokens();
 
     const size_t n = dit_part_paths_.size();
@@ -382,9 +437,9 @@ class PipelineZImage : public PipelineQnn {
 
       StatusCode st =
           (i == 0) ? part->executeZImageDitFirst(
-                         sample, timestep, context, pos_ids_.data(),
-                         attn_mask_.data(), cap_pad_mask_.data(), tokens,
-                         dit_state_, terminal ? out : nullptr)
+                         sample, timestep, cap_, pos_ids_.data(),
+                         attn_mask_.data(), tokens, dit_state_,
+                         terminal ? out : nullptr)
                    : part->executeZImageDitNext(dit_state_, pos_ids_.data(),
                                                 attn_mask_.data(), tokens,
                                                 terminal ? out : nullptr);
@@ -523,16 +578,36 @@ class PipelineZImage : public PipelineQnn {
                                  std::to_string(i + 1));
       if (i == 0 && sf_bytes) head = dit_parts_[0]->getContextHandle();
     }
-    QNN_INFO("[lowram] Z-Image DiT parts loaded (%zu)", dit_parts_.size());
+    // The caption branch joins the same group. It executes before part 1 and
+    // never alongside it, so it shares the scratch buffer like everything else;
+    // it is created after the head and released before it.
+    cap_part_ = qnn_runtime::createModel(cap_part_path_, "unet_cap");
+    if (!cap_part_)
+      throw std::runtime_error(
+          "[lowram] Failed to create the Z-Image DiT caption branch");
+    cap_part_->setSpillFillGroup(sf_bytes, head);
+    if (qnn_runtime::initializeApp("unet_cap", cap_part_) != EXIT_SUCCESS)
+      throw std::runtime_error(
+          "[lowram] Failed to init the Z-Image DiT caption branch");
+    QNN_INFO("[lowram] Z-Image DiT parts loaded (%zu + caption)",
+             dit_parts_.size());
   }
   void releaseDitParts() {
-    bool any = false;
+    bool any = cap_part_ != nullptr;
+    cap_part_.reset();
     // Reverse order: every group reference dies before its head (part 1).
     for (size_t i = dit_parts_.size(); i-- > 0;) {
       if (!dit_parts_[i]) continue;
       dit_parts_[i].reset();
       any = true;
     }
+    // The refined caption outlives no DiT context: dropping it here is what
+    // makes the next generation recompute it against whatever graphs are
+    // loaded then, rather than trust a buffer from a released one.
+    cap_.clear();
+    cap_.shrink_to_fit();
+    cap_key_.clear();
+    cap_key_.shrink_to_fit();
     if (any && lowram_) QNN_INFO("[lowram] Z-Image DiT parts released");
   }
 
@@ -549,6 +624,13 @@ class PipelineZImage : public PipelineQnn {
   void releaseDitPart(size_t i) {
     if (!dit_parts_[i]) return;
     dit_parts_[i].reset();
+  }
+  void loadCapPartAlone() {
+    if (cap_part_) return;
+    cap_part_ = qnn_runtime::createAndInitModel(cap_part_path_, "unet_cap");
+    if (!cap_part_)
+      throw std::runtime_error(
+          "[seq_dit] Failed to load the Z-Image DiT caption branch");
   }
 
   void loadVaeEncoderIfNeeded() {
@@ -579,6 +661,7 @@ class PipelineZImage : public PipelineQnn {
 
   const std::vector<std::string> clip_part_paths_;
   const std::vector<std::string> dit_part_paths_;
+  const std::string cap_part_path_;
   const std::string vae_decoder_path_;
   const std::string vae_encoder_path_;
   const bool lowram_;
@@ -589,6 +672,12 @@ class PipelineZImage : public PipelineQnn {
   // rather than on the stack: it is 5 MB and encodeText runs per prompt.
   std::vector<float> clip_state_;
   std::vector<std::unique_ptr<QnnModel>> dit_parts_;
+  // The caption branch and its result, [1, S, dim]. Held across steps: nothing
+  // in that graph depends on the timestep. cap_key_ is the concatenation of the
+  // inputs it was computed from (context ++ cap_pad_mask); see ensureCaption.
+  std::unique_ptr<QnnModel> cap_part_;
+  std::vector<float> cap_;
+  std::vector<float> cap_key_;
   // {hidden, emb} handed from one part to the next, reused across steps.
   std::vector<std::vector<float>> dit_state_;
   // Rebuilt per CFG branch (the two sides can have different prompt lengths),

@@ -47,8 +47,8 @@
 //   anima:   tokenizer.json tokenizer_t5.json token_emb.bin clip.bin
 //            unet_part1.bin unet_part2.bin vae_decoder.bin
 //            [vae_encoder.bin] (optional; enables img2img/inpaint)
-//   zimage:  tokenizer.json token_emb.bin clip.bin
-//            unet_part1.bin .. unet_partN.bin vae_decoder.bin
+//   zimage:  tokenizer.json token_emb.bin clip_part1.bin .. clip_partM.bin
+//            unet_cap.bin unet_part1.bin .. unet_partN.bin vae_decoder.bin
 //            [vae_encoder.bin] (optional; enables img2img/inpaint)
 // SD15/SDXL CLIP runs on MNN (CPU); the DiT formats run their text encoder
 // (clip.bin) on QNN/HTP (the C++ side still does the qwen token_emb lookup ->
@@ -343,6 +343,16 @@ static std::unique_ptr<Pipeline> createPipeline(const ServerOptions &opts,
     QNN_INFO("zimage: found %zu DiT part(s), %zu text encoder part(s)",
              dit_parts.size(), clip_parts.size());
 
+    // The caption branch: cap_embedder + context_refiner, split out of part 1
+    // because the two together exceeded what the converting machine could
+    // compile. Its absence means an older model directory, not a corrupt one,
+    // so say which.
+    std::string cap_part_path = (dir / "unet_cap.bin").string();
+    if (!std::filesystem::exists(cap_part_path))
+      showHelpAndExit("File not found: " + cap_part_path +
+                      " (the DiT's caption branch; a model directory without "
+                      "it predates the split and has to be re-downloaded)");
+
     std::vector<std::string> required = {
         (dir / "tokenizer.json").string(),
         (dir / "token_emb.bin").string(),
@@ -354,8 +364,8 @@ static std::unique_ptr<Pipeline> createPipeline(const ServerOptions &opts,
     }
     return std::make_unique<PipelineZImage>(
         text_encoder, opts.model_dir, std::move(clip_parts),
-        std::move(dit_parts), vae_decoder_path, vae_encoder_path, opts.lowram,
-        opts.anima_seq_dit);
+        std::move(dit_parts), cap_part_path, vae_decoder_path, vae_encoder_path,
+        opts.lowram, opts.anima_seq_dit);
   }
 
   // Anima: Qwen "CLIP" (clip.bin, QNN) + split DiT (unet_part1/2.bin) + 16-ch

@@ -19,8 +19,8 @@ Filling every float input with N(0,1) is wrong for four of the DiT's six:
                 sequence at random and leaves the rest partially attenuated.
   cap_pad_mask  likewise 0/1.
 
-Only `sample` (latents), `hidden_in` (an RMS-normed residual stream), `emb` and
-`context` are legitimately near-unit-Gaussian.
+Only `sample` (latents), `hidden_in` and `cap` (both RMS-normed activations),
+`emb` and `context` are legitimately near-unit-Gaussian.
 
     python make_calib.py <onnx> <out_dir> <list_file> [--true-len 128]
 
@@ -86,8 +86,8 @@ def make(onnx_path, out_dir, list_path, true_len=128, seed=0):
             data[..., :true_len] = 1.0
             how = f"1 for the first {true_len} tokens, 0 padding"
         else:
-            # sample, hidden_in, emb, context, input_embedding -- all genuinely
-            # near-unit-Gaussian at runtime.
+            # sample, hidden_in, cap, emb, context, input_embedding -- all
+            # genuinely near-unit-Gaussian at runtime.
             data, how = rng.standard_normal(dims, dtype=np.float32), "N(0,1)"
 
         if inp.type.tensor_type.elem_type == onnx.TensorProto.INT32:

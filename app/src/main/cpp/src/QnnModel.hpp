@@ -934,15 +934,32 @@ class QnnModel : public QnnSampleApp {
   // every block, so later parts take it directly and never see `timestep`.
   //
   // 6B parameters do not fit a single HTP context at any supported weight
-  // width, so the DiT is exported as N pieces cut between transformer blocks.
-  // The chain is uniform and N is discovered on disk, not fixed here:
-  //   part 1    : (sample, timestep, context, pos_ids, attn_mask,
-  //                cap_pad_mask)                        -> (hidden, emb)
+  // width, so the DiT is exported as N pieces cut between transformer blocks,
+  // plus one piece cut along the model's own branch structure. The chain is
+  // uniform and N is discovered on disk, not fixed here:
+  //   caption   : (context, pos_ids, attn_mask, cap_pad_mask) -> (cap)
+  //   part 1    : (sample, timestep, cap, pos_ids)       -> (hidden, emb)
   //   part 1<k<N: (hidden, emb, pos_ids, attn_mask)      -> (hidden)
   //   part N    : (hidden, emb, pos_ids, attn_mask)      -> (out_sample)
   // A part is recognised as terminal purely by exposing an output named
   // `out_sample`, so a single-context export (N = 1, i.e. part 1 terminal)
   // needs no special case.
+  //
+  // The caption graph exists because the two embedders and both refiner stacks
+  // together put context-binary generation over the converting machine's
+  // memory. The cut follows the model: the caption path (cap_embedder +
+  // context_refiner) and the image path (x_embedder + noise_refiner) never
+  // exchange a tensor before the concatenation that forms the residual stream,
+  // so separating them changes nothing numerically. It also earns something —
+  // the caption branch is the only part of the DiT that does not depend on the
+  // timestep, so it runs once per prompt rather than once per step.
+  //
+  // `attn_mask` is not an input to part 1. With the caption refiner gone it has
+  // no operation left to feed there, and the converter drops inputs nothing
+  // reads; declaring it in the app would only mean looking for a tensor the
+  // graph does not have. A part 1 that DOES own transformer blocks (a coarser
+  // split than the shipped one) declares it again, so the binding is by
+  // presence rather than by assumption.
   // The residual stream is named differently on the way in and on the way out,
   // and that is forced rather than stylistic: torch.onnx.export cannot give a
   // graph an input and an output with the same name, and silently renames the
@@ -1011,9 +1028,15 @@ class QnnModel : public QnnSampleApp {
 
   // Binds the per-token RoPE coordinates (int32, bound directly like Anima's
   // t5_ids) and the attention mask. Shared by every part of the chain.
+  //
+  // `mask_required` is false only for part 1, which does not declare
+  // `attn_mask` in the shipped split (see the contract note above). Everywhere
+  // else a missing mask means the graph is not the one this code thinks it is,
+  // and running unmasked would silently attend to caption slots the reference
+  // never created.
   bool writeZImagePositions(const qnn_wrapper_api::GraphInfo_t &graphInfo,
                             const int32_t *pos_ids, const float *attn_mask,
-                            size_t tokens) {
+                            size_t tokens, bool mask_required = true) {
     Qnn_Tensor_t *pi =
         findTensor(inputs, graphInfo.numInputTensors, "pos_ids");
     if (!pi) {
@@ -1029,16 +1052,50 @@ class QnnModel : public QnnSampleApp {
     }
     memcpy(QNN_TENSOR_GET_CLIENT_BUF(*pi).data, pos_ids,
            want * sizeof(int32_t));
+    if (!mask_required &&
+        !findTensor(inputs, graphInfo.numInputTensors, "attn_mask"))
+      return true;
     return writeNamedFloat(graphInfo, "attn_mask", attn_mask, tokens);
   }
 
-  // part 1: (sample, timestep, context, pos_ids, attn_mask) -> (hidden, emb),
-  // or straight to out_sample when the whole DiT fits one context.
+  // The caption branch: (context, pos_ids, attn_mask, cap_pad_mask) -> (cap).
+  // Runs once per prompt — nothing here depends on the timestep.
+  StatusCode executeZImageDitCaption(const float *context,
+                                     const int32_t *pos_ids,
+                                     const float *attn_mask,
+                                     const float *cap_pad_mask, size_t tokens,
+                                     std::vector<float> &cap) {
+    if (!ensureIoTensors()) return StatusCode::FAILURE;
+    auto graphInfo = (*m_graphsInfo)[0];
+    logGraphIoOnce("zimage", "dit_caption", graphInfo);
+
+    const size_t ctx_elems =
+        (size_t)zimage_text_seq_len * zimage_text_embedding_size;
+    if (!writeNamedFloat(graphInfo, "context", context, ctx_elems) ||
+        !writeNamedFloat(graphInfo, "cap_pad_mask", cap_pad_mask,
+                         zimage_text_seq_len) ||
+        !writeZImagePositions(graphInfo, pos_ids, attn_mask, tokens))
+      return StatusCode::FAILURE;
+
+    if (!runGraph(graphInfo, "zimage dit caption")) return StatusCode::FAILURE;
+
+    Qnn_Tensor_t *t = findTensor(outputs, graphInfo.numOutputTensors, "cap");
+    if (!t) {
+      QNN_ERROR("zimage dit caption: missing output 'cap'");
+      return StatusCode::FAILURE;
+    }
+    const size_t n = tensorElems(*t);
+    cap.resize(n);
+    memcpy(cap.data(), QNN_TENSOR_GET_CLIENT_BUF(*t).data, n * sizeof(float));
+    return StatusCode::SUCCESS;
+  }
+
+  // part 1: (sample, timestep, cap, pos_ids) -> (hidden, emb), or straight to
+  // out_sample when the whole DiT fits one context.
   StatusCode executeZImageDitFirst(const float *sample, float timestep,
-                                   const float *context,
+                                   const std::vector<float> &cap,
                                    const int32_t *pos_ids,
-                                   const float *attn_mask,
-                                   const float *cap_pad_mask, size_t tokens,
+                                   const float *attn_mask, size_t tokens,
                                    std::vector<std::vector<float>> &state,
                                    float *out_sample) {
     if (!ensureIoTensors()) return StatusCode::FAILURE;
@@ -1047,14 +1104,15 @@ class QnnModel : public QnnSampleApp {
 
     const size_t latent_elems =
         (size_t)zimage_latent_channels * sample_width * sample_height;
-    const size_t ctx_elems =
-        (size_t)zimage_text_seq_len * zimage_text_embedding_size;
+    if (cap.empty()) {
+      QNN_ERROR("zimage dit part1: the caption branch has not run");
+      return StatusCode::FAILURE;
+    }
     if (!writeNamedFloat(graphInfo, "sample", sample, latent_elems) ||
         !writeNamedFloat(graphInfo, "timestep", &timestep, 1) ||
-        !writeNamedFloat(graphInfo, "context", context, ctx_elems) ||
-        !writeNamedFloat(graphInfo, "cap_pad_mask", cap_pad_mask,
-                         zimage_text_seq_len) ||
-        !writeZImagePositions(graphInfo, pos_ids, attn_mask, tokens))
+        !writeNamedFloat(graphInfo, "cap", cap.data(), cap.size()) ||
+        !writeZImagePositions(graphInfo, pos_ids, attn_mask, tokens,
+                              /*mask_required=*/false))
       return StatusCode::FAILURE;
 
     if (!runGraph(graphInfo, "zimage dit part1")) return StatusCode::FAILURE;

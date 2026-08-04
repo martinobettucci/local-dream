@@ -16,7 +16,7 @@
 #   PY=... QNN=... ./convert_part.sh <work_dir> <part> <n_parts> [bits] [dsp_arch]
 set -euo pipefail
 
-W="${1:?work dir}"; N="${2:?part number}"; NPARTS="${3:?total parts}"
+W="${1:?work dir}"; N="${2:?part number, or \"cap\"}"; NPARTS="${3:?total parts}"
 WBITS="${4:-4}"; ARCH="${5:-v73}"
 SCRATCH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export QNN_SDK_ROOT="${QNN_SDK_ROOT:-/data/qairt/2.39.0.250926}"
@@ -26,9 +26,17 @@ BIN="$QNN_SDK_ROOT/bin/x86_64-linux-clang"
 PY="${PY:?set PY to the torch venv python}"
 QNN="${QNN:?set QNN to the python3.10 venv python}"
 
-ODIR="$W/onnx/part$N"; OUT="$W/out"; STATS="$W/stats"; mkdir -p "$OUT" "$STATS"
+# The caption branch (cap_embedder + context_refiner) is a graph of its own,
+# built by exactly these five stages under a different name. See
+# CAP_INPUT_NAMES in static_export.py for why it is separate at all.
+if [ "$N" = "cap" ]; then
+  STEM="unet_cap"; ODIR="$W/onnx/cap"; EXPORT_ARGS=(--cap)
+else
+  STEM="unet_part$N"; ODIR="$W/onnx/part$N"; EXPORT_ARGS=(--only "$N")
+fi
+OUT="$W/out"; STATS="$W/stats"; mkdir -p "$OUT" "$STATS"
 free_gb() { df -BG --output=avail "$W" | tail -1 | tr -dc '0-9'; }
-say() { echo "[part$N/$NPARTS] $* (free $(free_gb)G)"; }
+say() { echo "[$STEM/$NPARTS] $* (free $(free_gb)G)"; }
 
 # A context binary is hundreds of MB; anything much smaller is a run that died
 # mid-write, and the resume gate must not accept it -- convert_all.sh would
@@ -40,7 +48,7 @@ bin_ok() { [ -f "$1" ] && [ "$(stat -c%s "$1")" -ge "$MIN_BIN_BYTES" ]; }
 # Peak RSS and wall clock per stage, appended to a per-part TSV. This is the
 # measurement that decides how many parts the split needs; without it the answer
 # is a guess that costs an hour per iteration to test.
-TSV="$STATS/part$N.tsv"
+TSV="$STATS/$STEM.tsv"
 run() {
   local stage="$1"; shift
   local t0 tmp rc
@@ -59,13 +67,13 @@ run() {
   return $rc
 }
 
-if bin_ok "$OUT/unet_part$N.bin"; then say "already built, skipping"; exit 0; fi
-rm -f "$OUT/unet_part$N.bin"   # present but too small: a dead run, not a result
+if bin_ok "$OUT/$STEM.bin"; then say "already built, skipping"; exit 0; fi
+rm -f "$OUT/$STEM.bin"   # present but too small: a dead run, not a result
 : > "$TSV"
 
 say "1/5 export ONNX"
-run export "$PY" "$SCRATCH/export_dit.py" --work "$W" --parts "$NPARTS" --only "$N"
-[ -f "$ODIR/unet_part$N.onnx" ] || { echo "export produced no ONNX"; exit 1; }
+run export "$PY" "$SCRATCH/export_dit.py" --work "$W" --parts "$NPARTS" "${EXPORT_ARGS[@]}"
+[ -f "$ODIR/$STEM.onnx" ] || { echo "export produced no ONNX"; exit 1; }
 say "2/5 ONNX built"
 
 # Calibration inputs are read off the ONNX (names, shapes and dtypes have to
@@ -81,7 +89,7 @@ say "2/5 ONNX built"
 # is deliberate -- reimplementing the coordinate arithmetic here in numpy would
 # be a second source of truth for the one piece of this pipeline whose earlier
 # divergence measured 15.6 % error.
-"$PY" "$SCRATCH/make_calib.py" "$ODIR/unet_part$N.onnx" "$W/calib$N" "$W/calib$N.txt"
+"$PY" "$SCRATCH/make_calib.py" "$ODIR/$STEM.onnx" "$W/calib$N" "$W/calib$N.txt"
 
 # Never pipe a stage through tail: the pipeline's exit status is tail's, so a
 # failed converter looks like success under `set -e`. Log in full, then verify
@@ -89,11 +97,11 @@ say "2/5 ONNX built"
 # earlier version reported "INFO_CONVERSION_SUCCESS" while writing no DLC, and
 # had already destroyed the fp16 source by then. That turned out to be how
 # qairt-converter reports running out of disk.
-run convert "$QNN" "$BIN/qairt-converter" --input_network "$ODIR/unet_part$N.onnx" \
-    --output_path "$W/unet_part$N.dlc" --preserve_io_datatype \
+run convert "$QNN" "$BIN/qairt-converter" --input_network "$ODIR/$STEM.onnx" \
+    --output_path "$W/$STEM.dlc" --preserve_io_datatype \
     > "$W/convert$N.log" 2>&1 \
     || { echo "convert FAILED:"; tail -20 "$W/convert$N.log"; exit 1; }
-if [ ! -s "$W/unet_part$N.dlc" ]; then
+if [ ! -s "$W/$STEM.dlc" ]; then
     echo "converter exited 0 but produced no DLC (free $(free_gb)G) — last lines:"
     tail -20 "$W/convert$N.log"; exit 1
 fi
@@ -131,12 +139,12 @@ say "3/5 DLC built, ONNX released"
 # All three runnable widths are the same size on disk. w4 is kept over w8 for
 # the documented VTCM latency benefit, not for bytes; switch to 8 if quality
 # turns out to be the binding problem, at no size cost.
-run quantize "$QNN" "$BIN/qairt-quantizer" --input_dlc "$W/unet_part$N.dlc" \
-    --output_dlc "$W/unet_part${N}_q.dlc" --input_list "$W/calib$N.txt" \
+run quantize "$QNN" "$BIN/qairt-quantizer" --input_dlc "$W/$STEM.dlc" \
+    --output_dlc "$W/${STEM}_q.dlc" --input_list "$W/calib$N.txt" \
     --weights_bitwidth "$WBITS" --act_bitwidth 16 --bias_bitwidth 32 \
     > "$W/quant$N.log" 2>&1 || { echo "quantize FAILED:"; tail -20 "$W/quant$N.log"; exit 1; }
-[ -s "$W/unet_part${N}_q.dlc" ] || { echo "no quantized DLC:"; tail -20 "$W/quant$N.log"; exit 1; }
-rm -f "$W/unet_part$N.dlc"; rm -rf "$W/calib$N"
+[ -s "$W/${STEM}_q.dlc" ] || { echo "no quantized DLC:"; tail -20 "$W/quant$N.log"; exit 1; }
+rm -f "$W/$STEM.dlc"; rm -rf "$W/calib$N"
 say "4/5 quantized w${WBITS}a16, float DLC released"
 
 cat > "$W/htp_$ARCH.json" <<J
@@ -145,13 +153,13 @@ J
 cat > "$W/ext_$ARCH.json" <<J
 {"backend_extensions":{"shared_library_path":"libQnnHtpNetRunExtensions.so","config_file_path":"$(cd "$W" && pwd)/htp_$ARCH.json"}}
 J
-run context "$BIN/qnn-context-binary-generator" --dlc_path "$W/unet_part${N}_q.dlc" \
+run context "$BIN/qnn-context-binary-generator" --dlc_path "$W/${STEM}_q.dlc" \
     --backend "$QNN_SDK_ROOT/lib/x86_64-linux-clang/libQnnHtp.so" \
     --config_file "$W/ext_$ARCH.json" --output_dir "$OUT" \
-    --binary_file "unet_part$N" > "$W/ctx$N.log" 2>&1 \
+    --binary_file "$STEM" > "$W/ctx$N.log" 2>&1 \
     || { echo "context binary FAILED:"; tail -20 "$W/ctx$N.log"; exit 1; }
-bin_ok "$OUT/unet_part$N.bin" || { echo "no usable .bin (got $(stat -c%s "$OUT/unet_part$N.bin" 2>/dev/null || echo 0) bytes):"; tail -20 "$W/ctx$N.log"; exit 1; }
-rm -f "$W/unet_part${N}_q.dlc"
-say "5/5 done -> $(stat -c%s "$OUT/unet_part$N.bin") bytes"
+bin_ok "$OUT/$STEM.bin" || { echo "no usable .bin (got $(stat -c%s "$OUT/$STEM.bin" 2>/dev/null || echo 0) bytes):"; tail -20 "$W/ctx$N.log"; exit 1; }
+rm -f "$W/${STEM}_q.dlc"
+say "5/5 done -> $(stat -c%s "$OUT/$STEM.bin") bytes"
 printf 'peak RSS across stages: %s MB\n' \
     "$(awk -F'\t' 'BEGIN{m=0} $2>m{m=$2} END{print int(m/1024)}' "$TSV")"
