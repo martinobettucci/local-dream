@@ -97,6 +97,22 @@ struct GenerationRequest {
 // step / total_steps / optional base64 preview image.
 using ProgressCallback = std::function<void(int, int, const std::string &)>;
 
+// Finer-grained progress WITHIN one of those steps: a stage name and a
+// done/total pair.
+//
+// The coarse callback fires at most `steps + 2` times, and for a model split
+// across many context binaries that is not enough to show anything is
+// happening. Z-Image is the extreme case: loading the text encoder means
+// mapping and initialising 6 context binaries totalling 3.6 GB before the
+// first coarse tick ever fires, then 33 more totalling 12.9 GB before the
+// second — so the bar sits at 0 %, then 20 %, for minutes at a time while the
+// device is in fact working hard.
+//
+// `total` may be 0, meaning "this stage has no measurable extent" (a decode,
+// say) — show the label without a bar.
+using SubProgressCallback =
+    std::function<void(const std::string &stage, int done, int total)>;
+
 // CLIP outputs for the [negative, positive] batch. `hidden` is what the UNet
 // consumes as encoder_hidden_states; `pooled` and `time_ids` only exist for
 // SDXL.
@@ -192,9 +208,17 @@ class Pipeline {
   // Mutates `req` only to release the decoded image buffer once it is no
   // longer needed (a ~190 MB allocation at ultrafix sizes).
   GenerationResult generate(GenerationRequest &req,
-                            const ProgressCallback &progress_callback);
+                            const ProgressCallback &progress_callback,
+                            const SubProgressCallback &sub_progress = nullptr);
 
  protected:
+  // Sub-step progress, for backends that spend minutes inside a single coarse
+  // step. Safe to call unconditionally: it is a no-op when the caller of
+  // generate() did not ask for it, and outside a generation.
+  void reportSub(const std::string &stage, int done = 0, int total = 0) {
+    if (sub_progress_) sub_progress_(stage, done, total);
+  }
+
   // --- stage hooks -------------------------------------------------------
   // Runs CLIP for the sides that missed the prompt cache, writing into the
   // matching halves of `cond`.
@@ -281,6 +305,8 @@ class Pipeline {
   const std::string model_dir_;
   const bool sdxl_;
   const bool use_v_pred_;
+  // Installed for the duration of one generate(); see reportSub.
+  SubProgressCallback sub_progress_;
 
   MNN::Interpreter *safety_interpreter_ = nullptr;
   MNN::Session *safety_session_ = nullptr;
@@ -867,7 +893,14 @@ inline std::string Pipeline::renderPreview(const GenerationRequest &req,
 }
 
 inline GenerationResult Pipeline::generate(
-    GenerationRequest &req, const ProgressCallback &progress_callback) {
+    GenerationRequest &req, const ProgressCallback &progress_callback,
+    const SubProgressCallback &sub_progress) {
+  // Installed for this call only. The pipeline object outlives the request and
+  // the sink the callback writes to does not, so it must not survive the
+  // return -- by any path, including a throw.
+  sub_progress_ = sub_progress;
+  ScopeExit sub_guard{[this]() { sub_progress_ = nullptr; }};
+
   if (req.prompt.empty()) throw std::invalid_argument("Prompt empty");
   if (safety_interpreter_ && !safety_session_)
     throw std::runtime_error("SafetyChecker missing");

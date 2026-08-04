@@ -83,6 +83,7 @@ import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LargeTopAppBar
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.LoadingIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
@@ -108,6 +109,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.layout.ContentScale
@@ -336,6 +338,11 @@ fun ModelRunScreen(
     var returnedSeed by remember { mutableStateOf<Long?>(null) }
     var isRunning by remember { mutableStateOf(false) }
     var progress by remember { mutableFloatStateOf(0f) }
+    // What the backend is doing inside the current step. Empty until a
+    // backend that reports sub-steps sends one, which is what keeps this
+    // invisible for the models that finish a step in under a second.
+    var subLabel by remember { mutableStateOf("") }
+    var subProgress by remember { mutableFloatStateOf(-1f) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var isCheckingBackend by remember { mutableStateOf(true) }
 
@@ -1150,6 +1157,7 @@ fun ModelRunScreen(
             }
             isRunning = false
             progress = 0f
+            subLabel = ""
             errorMessage = null
             currentBatchIndex = 0
             generationStartTime = null
@@ -1181,6 +1189,7 @@ fun ModelRunScreen(
         pendingUltrafix = false
         isRunning = false
         progress = 0f
+        subLabel = ""
         currentBatchIndex = 0
         generationStartTime = null
         Toast.makeText(
@@ -1356,6 +1365,8 @@ fun ModelRunScreen(
                     generationStartTime = System.currentTimeMillis()
                 }
                 progress = state.progress
+                subLabel = state.subLabel
+                subProgress = state.subProgress
                 isRunning = true
                 state.intermediateImage?.let { intermediateBitmap = it }
             }
@@ -1367,6 +1378,7 @@ fun ModelRunScreen(
 
                     state.seed?.let { returnedSeed = it }
                     progress = 0f
+                    subLabel = ""
 
                     val genTime = generationStartTime?.let { startTime ->
                         val endTime = System.currentTimeMillis()
@@ -1474,6 +1486,7 @@ fun ModelRunScreen(
                 errorMessage = state.message
                 isRunning = false
                 progress = 0f
+                subLabel = ""
                 generationStartTime = null
                 pendingUltrafix = false
             }
@@ -1481,6 +1494,7 @@ fun ModelRunScreen(
             else -> {
                 isRunning = false
                 progress = 0f
+                subLabel = ""
             }
         }
     }
@@ -2187,6 +2201,41 @@ fun ModelRunScreen(
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
+                        // Second bar: where we are inside the current step. A
+                        // 6B model split across 33 context binaries spends
+                        // minutes between ticks of the bar above, and a bar
+                        // that does not move is indistinguishable from a hang.
+                        if (subLabel.isNotEmpty()) {
+                            Spacer(modifier = Modifier.height(2.dp))
+                            if (subProgress >= 0f) {
+                                LinearProgressIndicator(
+                                    progress = { subProgress },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(3.dp),
+                                    color = MaterialTheme.colorScheme.secondary,
+                                    trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                                    strokeCap = StrokeCap.Round,
+                                    drawStopIndicator = {},
+                                )
+                            } else {
+                                // No measurable extent (a decode): show motion
+                                // rather than a bar frozen at some fraction.
+                                LinearProgressIndicator(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(3.dp),
+                                    color = MaterialTheme.colorScheme.secondary,
+                                    trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                                    strokeCap = StrokeCap.Round,
+                                )
+                            }
+                            Text(
+                                subLabel,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
                         intermediateBitmap?.let { bitmap ->
                             Spacer(modifier = Modifier.height(8.dp))
                             Card(

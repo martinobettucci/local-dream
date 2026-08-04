@@ -505,6 +505,22 @@ static void registerGenerateEndpoint(httplib::Server &svr, Pipeline *pipeline) {
                         !sink.write(ev.c_str(), ev.size()))
                       throw std::runtime_error(
                           "Client disconnected, generation aborted");
+                  },
+                  // Sub-step progress. A separate message type rather than more
+                  // fields on "progress": these carry no step number, and a
+                  // client that does not know about them must leave the coarse
+                  // bar where it is rather than reset it to zero.
+                  [&sink](const std::string &stage, int done, int total) {
+                    nlohmann::json p = {{"type", "substep"},
+                                        {"stage", stage},
+                                        {"sub", done},
+                                        {"sub_total", total}};
+                    std::string ev =
+                        "event: progress\ndata: " + p.dump() + "\n\n";
+                    if (!sink.is_writable() ||
+                        !sink.write(ev.c_str(), ev.size()))
+                      throw std::runtime_error(
+                          "Client disconnected, generation aborted");
                   });
               auto enc_start = std::chrono::high_resolution_clock::now();
               std::string enc_img =

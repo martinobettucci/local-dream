@@ -95,7 +95,19 @@ class BackgroundGenerationService : Service() {
 
     sealed class GenerationState {
         object Idle : GenerationState()
-        data class Progress(val progress: Float, val intermediateImage: Bitmap? = null) : GenerationState()
+        // `subLabel` / `subProgress` describe what is happening INSIDE the
+        // current coarse step. A model split across dozens of context binaries
+        // spends minutes between coarse ticks -- Z-Image maps 3.6 GB of text
+        // encoder before the first one fires and 12.9 GB of DiT before the
+        // second -- so without these the bar reads 0 % while the device is
+        // working hard. subProgress is negative when the stage has no
+        // measurable extent (a decode); show the label alone.
+        data class Progress(
+            val progress: Float,
+            val intermediateImage: Bitmap? = null,
+            val subLabel: String = "",
+            val subProgress: Float = -1f,
+        ) : GenerationState()
 
         data class Complete(val bitmap: Bitmap, val seed: Long?) : GenerationState()
         data class Error(val message: String) : GenerationState()
@@ -333,6 +345,17 @@ class BackgroundGenerationService : Service() {
                     // fresh width*height IntArray (4 MB at 1024x1024).
                     var previewPixels: IntArray? = null
 
+                    // The two progress channels arrive as separate messages and
+                    // each has to re-emit the other's last value, since the UI
+                    // state is one immutable object. Without holding the coarse
+                    // progress here, every sub-step would reset the main bar to
+                    // zero; without holding the preview, it would blink out
+                    // between steps.
+                    var coarseProgress = 0f
+                    var lastPreview: Bitmap? = null
+                    var subLabel = ""
+                    var subProgress = -1f
+
                     // Read line by line for efficiency
                     readLoop@ while (isActive) {
                         val readLineStart = System.currentTimeMillis()
@@ -349,6 +372,29 @@ class BackgroundGenerationService : Service() {
                             messageCount++
 
                             when (message.optString("type")) {
+                                "substep" -> {
+                                    val stage = message.optString("stage")
+                                    val done = message.optInt("sub")
+                                    val total = message.optInt("sub_total")
+                                    subLabel = if (total > 0) {
+                                        "$stage ${done + 1}/$total"
+                                    } else {
+                                        stage
+                                    }
+                                    subProgress =
+                                        if (total > 0) done.toFloat() / total else -1f
+                                    // Reuse the last coarse progress and preview:
+                                    // a sub-step changes neither.
+                                    updateState(
+                                        GenerationState.Progress(
+                                            coarseProgress,
+                                            lastPreview,
+                                            subLabel,
+                                            subProgress,
+                                        )
+                                    )
+                                }
+
                                 "progress" -> {
                                     val step = message.optInt("step")
                                     val totalSteps = message.optInt("total_steps")
@@ -391,7 +437,16 @@ class BackgroundGenerationService : Service() {
                                         }
                                     }
 
-                                    updateState(GenerationState.Progress(progress, bitmap))
+                                    coarseProgress = progress
+                                    if (bitmap != null) lastPreview = bitmap
+                                    updateState(
+                                        GenerationState.Progress(
+                                            progress,
+                                            bitmap,
+                                            subLabel,
+                                            subProgress,
+                                        )
+                                    )
                                     updateNotification(progress)
                                 }
 

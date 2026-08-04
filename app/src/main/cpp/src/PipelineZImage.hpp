@@ -270,6 +270,7 @@ class PipelineZImage : public PipelineQnn {
 
   void vaeDecode(const GenerationRequest &, const float *latents,
                  float *pixels) override {
+    reportSub("Decoding image");
     if (lowram_ && !vae_decoder_) {
       vae_decoder_ =
           qnn_runtime::createAndInitModel(vae_decoder_path_, "vae_decoder");
@@ -388,6 +389,7 @@ class PipelineZImage : public PipelineQnn {
                pad_n * sizeof(float)) == 0;
     if (hit) return;
 
+    reportSub("Caption branch");
     if (seq_dit_) loadCapPartAlone();
     if (!cap_part_)
       throw std::runtime_error("Z-Image DiT caption branch not loaded");
@@ -420,6 +422,9 @@ class PipelineZImage : public PipelineQnn {
 
     const size_t n = dit_part_paths_.size();
     for (size_t i = 0; i < n; ++i) {
+      // Once per graph, ~33 times per step. This is the one that ticks
+      // steadily and tells the user the device has not hung.
+      reportSub("DiT", (int)i, (int)n);
       if (seq_dit_) loadDitPartAlone(i);
       QnnModel *part = dit_parts_[i].get();
       if (!part)
@@ -476,6 +481,7 @@ class PipelineZImage : public PipelineQnn {
       if (!part)
         throw std::runtime_error("Z-Image text encoder part " +
                                  std::to_string(i + 1) + " not loaded");
+      reportSub("Text encoder", (int)i, (int)clip_parts_.size());
       const bool last = (i + 1 == clip_parts_.size());
       // The chain has to END on the part that emits `context`. If the model
       // directory is missing trailing parts -- an interrupted download, a
@@ -530,6 +536,9 @@ class PipelineZImage : public PipelineQnn {
     const uint64_t sf_bytes = spillFillGroupBytes();
     Qnn_ContextHandle_t head = nullptr;
     for (size_t i = 0; i < clip_part_paths_.size(); ++i) {
+      // 3.6 GB of context binaries, and until this loop finishes nothing has
+      // reported progress even once. Say which one is being mapped.
+      reportSub("Loading text encoder", (int)i, (int)clip_part_paths_.size());
       clip_parts_[i] =
           qnn_runtime::createModel(clip_part_paths_[i], clipTag(i).c_str());
       if (!clip_parts_[i])
@@ -566,7 +575,11 @@ class PipelineZImage : public PipelineQnn {
                (unsigned long long)sf_bytes);
 
     Qnn_ContextHandle_t head = nullptr;
+    // The single longest silent stretch in a generation: 12.9 GB of context
+    // binaries, all mapped before the first denoising step can start.
+    const int n_load = (int)dit_parts_.size() + 1;      // + the caption branch
     for (size_t i = 0; i < dit_parts_.size(); ++i) {
+      reportSub("Loading DiT", (int)i, n_load);
       dit_parts_[i] =
           qnn_runtime::createModel(dit_part_paths_[i], partTag(i).c_str());
       if (!dit_parts_[i])
@@ -582,6 +595,7 @@ class PipelineZImage : public PipelineQnn {
     // The caption branch joins the same group. It executes before part 1 and
     // never alongside it, so it shares the scratch buffer like everything else;
     // it is created after the head and released before it.
+    reportSub("Loading DiT", n_load - 1, n_load);
     cap_part_ = qnn_runtime::createModel(cap_part_path_, "unet_cap");
     if (!cap_part_)
       throw std::runtime_error(
