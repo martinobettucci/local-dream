@@ -55,11 +55,11 @@ class BackendService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + backendDispatcher)
 
     companion object {
-        private const val LOG_TAIL_LINES = 40
+        private const val LOG_TAIL_LINES = 80
         private val recentLog = ArrayDeque<String>()
 
         /** Last lines the backend printed, newest last. Empty if it never ran. */
-        fun logTail(maxLines: Int = 12): String = synchronized(recentLog) {
+        fun logTail(maxLines: Int = 25): String = synchronized(recentLog) {
             recentLog.takeLast(maxLines).joinToString("\n")
         }
 
@@ -586,15 +586,14 @@ class BackendService : Service() {
             val systemLibPathsStr = systemLibPaths.joinToString(":")
             env["LD_LIBRARY_PATH"] = systemLibPathsStr
             env["DSP_LIBRARY_PATH"] = runtimeDir.absolutePath
-            if (config.backendType == "zimage") {
-                // Text-encoder contexts one at a time: 620 MB peak instead of
-                // six co-resident (3.7 GB), which put a 16 GB phone into swap
-                // thrash -- the backend does not die there, it grinds forever
-                // at "Loading text encoder 3/6", alive, so no closed socket
-                // and no error, ever. The watchdog now catches that state;
-                // not entering it is the actual fix.
-                env["LOCALDREAM_ZIMAGE_SEQ_CLIP"] = "1"
-            }
+            // LOCALDREAM_ZIMAGE_SEQ_CLIP deliberately NOT set. Loading
+            // encoder contexts one at a time crashes the backend natively in
+            // the create/destroy churn -- the device report showed it dying
+            // mid power-config, the first thing context bring-up does. The
+            // co-resident path's memory problem is attacked in the pipeline
+            // instead (the encoder group no longer reserves the DiT-sized
+            // spill-fill buffer). The env var stays available over adb for
+            // experiments.
 
             Log.d(TAG, "COMMAND: ${command.joinToString(" ")}")
             Log.d(TAG, "DIR: $runtimeDir")
@@ -626,6 +625,16 @@ class BackendService : Service() {
     // actually reads. The monitor thread writes it, the generation coroutine
     // reads it.
     private fun rememberLogLine(line: String) {
+        // QNN's DSP layer prints thousands of INFO/VERBOSE lines (power
+        // configs, graph setup) that would evict the one line naming a crash
+        // within milliseconds. Keep the ring for lines that can carry blame:
+        // errors, warnings, and the backend's own prints. The full stream
+        // still goes to logcat above.
+        if (line.contains("[ INFO ] Qnn") || line.contains("[VERBOSE]") ||
+            line.contains("[ DEBUG ]")
+        ) {
+            return
+        }
         synchronized(recentLog) {
             recentLog.addLast(line)
             while (recentLog.size > LOG_TAIL_LINES) recentLog.removeFirst()

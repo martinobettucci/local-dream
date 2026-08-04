@@ -541,11 +541,16 @@ class PipelineZImage : public PipelineQnn {
   // elsewhere at that moment.
   void loadClipIfNeeded() {
     if (!clip_parts_.empty() && clip_parts_.front()) return;
-    // The parts execute strictly in sequence and never concurrently, so they
-    // share one HTP spill-fill scratch buffer rather than allocating one each.
-    // With a single clip.bin that distinction did not exist; with six of them
-    // it is the difference between one scratch allocation and six.
-    const uint64_t sf_bytes = spillFillGroupBytes();
+    // NO spill-fill group for the encoder, and that is a memory decision, not
+    // an omission. The group size (601 MB) was measured for a 4608-token DiT
+    // graph; these are 512-token encoder graphs whose natural scratch is a
+    // couple of orders of magnitude smaller. Requesting the group reserves the
+    // full 601 MB up front -- and if group registration fails quietly, six
+    // contexts reserve it EACH, which is 3.6 GB of scratch for graphs that
+    // need none of it, on top of their 3.7 GB of weights. That is the
+    // difference between an encoder stage that fits a 16 GB phone and the
+    // swap-thrash freeze at "Loading text encoder 3/6".
+    const uint64_t sf_bytes = 0;
     Qnn_ContextHandle_t head = nullptr;
     for (size_t i = 0; i < clip_part_paths_.size(); ++i) {
       // 3.6 GB of context binaries, and until this loop finishes nothing has
