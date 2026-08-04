@@ -504,14 +504,25 @@ class BackendService : Service() {
             if (backendType == "sdxl" && preferences.getBoolean("sdxl_lowram", true)) {
                 command += "--lowram"
             }
-            if ((backendType == "anima" || backendType == "zimage") &&
-                preferences.getBoolean("anima_lowram", true)
+            // Z-Image is not a model whose residency is a preference: its
+            // context binaries total 17.6 GB, so running it without --lowram
+            // asks for more memory than any phone has, and the failure is
+            // silent -- the backend never binds its port and the health check
+            // reports "Backend start failed. Maybe your device is not
+            // supported", which blames the SoC for a problem it has nothing to
+            // do with. The backend forces the flag on as well; passing it here
+            // too keeps behaviour the same whoever launches the process.
+            // The toggle still governs Anima, whose two DiT parts do fit.
+            if (backendType == "zimage" ||
+                (backendType == "anima" &&
+                    preferences.getBoolean("anima_lowram", true))
             ) {
                 command += "--lowram"
                 // Aggressive variant: hold only one DiT part resident at a
-                // time, so 12GB devices can run these low-RAM. Slower per step,
-                // and much more so for Z-Image, whose 6B DiT is split into more
-                // parts than Anima's two.
+                // time. For Anima this is the 12GB-device option; for Z-Image
+                // it is not optional at all -- the whole DiT is 33 contexts and
+                // 12.9 GB, so the backend defaults it on there and the opt-out
+                // is an env var, not this toggle.
                 if (preferences.getBoolean("anima_seq_dit", false)) {
                     command += "--anima_seq_dit"
                 }

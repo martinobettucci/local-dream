@@ -84,6 +84,10 @@ inline constexpr int zimage_rope_axis_len_t = 1536;
 // part plus a calibration sample's activations, and was OOM-killed at 19 GB on
 // a 4-block part. One block per part is the finest useful split (30 blocks),
 // and this has to admit it.
-inline constexpr int zimage_max_dit_parts = 32;
+// Discovery stops at the first gap, so this is only a runaway guard. The
+// published build has 32 parts plus the caption branch; the headroom is
+// deliberate, since a limit that exactly equals the current count turns any
+// future re-split into a truncated chain.
+inline constexpr int zimage_max_dit_parts = 64;
 
 #endif  // CONFIG_HPP

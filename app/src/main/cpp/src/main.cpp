@@ -362,10 +362,56 @@ static std::unique_ptr<Pipeline> createPipeline(const ServerOptions &opts,
     for (const auto &p : required) {
       if (!std::filesystem::exists(p)) showHelpAndExit("File not found: " + p);
     }
+
+    // Z-Image is not a model whose residency is a preference. The context
+    // binaries total 17.6 GB, and holding them all is what --lowram turns off,
+    // so running without it asks a phone for more memory than any phone has.
+    // What actually happens is not an out-of-memory message but a silence: the
+    // backend sits in initialize() mapping context after context, never binds
+    // its port, and the app's 60-second health check gives up with "Backend
+    // start failed. Maybe your device is not supported" -- a message about the
+    // SoC for a problem that has nothing to do with it.
+    //
+    // So the flag is forced rather than obeyed, and says so. The shared
+    // anima/zimage toggle in the app still means something for Anima, whose
+    // two DiT parts do fit.
+    const size_t n_ctx = dit_parts.size() + clip_parts.size() + 2;
+    bool lowram = opts.lowram;
+    if (!lowram) {
+      QNN_WARN(
+          "zimage: --lowram was not requested, but %zu context binaries "
+          "(~17.6 GB) cannot be resident at once on any device. Enabling it; "
+          "the model is loaded and released per stage instead.",
+          n_ctx);
+      lowram = true;
+    }
+    // Same argument one level down. Even with per-stage loading the whole DiT
+    // is resident together for the denoising loop -- 33 contexts, 12.9 GB --
+    // which is beyond a 16 GB phone once Android and the app are counted. One
+    // part at a time is 489 MB, at the cost of reloading each one every step.
+    // Set LOCALDREAM_ZIMAGE_RESIDENT_DIT=1 to keep the whole DiT resident on a
+    // device with the headroom for it.
+    bool seq_dit = opts.anima_seq_dit;
+    if (!seq_dit) {
+      const char *resident = getenv("LOCALDREAM_ZIMAGE_RESIDENT_DIT");
+      if (resident && *resident == '1') {
+        QNN_INFO("zimage: LOCALDREAM_ZIMAGE_RESIDENT_DIT=1, keeping all %zu "
+                 "DiT contexts resident for the denoising loop",
+                 dit_parts.size());
+      } else {
+        QNN_INFO(
+            "zimage: holding one DiT part at a time (%zu parts, 12.9 GB if "
+            "resident). Slower per step; set "
+            "LOCALDREAM_ZIMAGE_RESIDENT_DIT=1 to keep them all loaded.",
+            dit_parts.size());
+        seq_dit = true;
+      }
+    }
+
     return std::make_unique<PipelineZImage>(
         text_encoder, opts.model_dir, std::move(clip_parts),
         std::move(dit_parts), cap_part_path, vae_decoder_path, vae_encoder_path,
-        opts.lowram, opts.anima_seq_dit);
+        lowram, seq_dit);
   }
 
   // Anima: Qwen "CLIP" (clip.bin, QNN) + split DiT (unet_part1/2.bin) + 16-ch
