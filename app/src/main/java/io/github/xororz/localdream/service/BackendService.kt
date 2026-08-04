@@ -56,6 +56,18 @@ class BackendService : Service() {
 
     companion object {
         private const val LOG_TAIL_LINES = 80
+        private const val LOG_FILE = "backend_last.log"
+        private const val LOG_FILE_MAX_BYTES = 256L * 1024
+
+        /** The persisted tail, which survives the app being killed. Falls back
+         * to the in-memory ring when the file is missing. */
+        fun persistedLog(context: Context, maxLines: Int = 60): String = try {
+            val f = File(context.filesDir, LOG_FILE)
+            if (f.exists()) f.readLines().takeLast(maxLines).joinToString("\n")
+            else logTail(maxLines)
+        } catch (_: Exception) {
+            logTail(maxLines)
+        }
         private val recentLog = ArrayDeque<String>()
 
         /** Last lines the backend printed, newest last. Empty if it never ran. */
@@ -629,6 +641,22 @@ class BackendService : Service() {
     // holding a phone -- so keep a small tail and put it in the error the user
     // actually reads. The monitor thread writes it, the generation coroutine
     // reads it.
+    // Mirror of the ring on disk. The in-memory tail dies with the process,
+    // and an app that is killed is exactly the failure we cannot otherwise
+    // observe -- so every kept line is appended here and the UI reads the file.
+    private fun appendToLogFile(line: String) {
+        try {
+            val f = File(filesDir, LOG_FILE)
+            if (f.length() > LOG_FILE_MAX_BYTES) {
+                val keep = f.readLines().takeLast(LOG_TAIL_LINES)
+                f.writeText(keep.joinToString("\n") + "\n")
+            }
+            f.appendText(line + "\n")
+        } catch (_: Exception) {
+            // Diagnostics must never be able to break a generation.
+        }
+    }
+
     private fun rememberLogLine(line: String) {
         // QNN's DSP layer prints thousands of INFO/VERBOSE lines (power
         // configs, graph setup) that would evict the one line naming a crash
@@ -644,6 +672,7 @@ class BackendService : Service() {
             recentLog.addLast(line)
             while (recentLog.size > LOG_TAIL_LINES) recentLog.removeFirst()
         }
+        appendToLogFile(line)
     }
 
     private fun startMonitorThread(proc: Process) {

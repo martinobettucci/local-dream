@@ -55,6 +55,7 @@ import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -343,6 +344,10 @@ fun ModelRunScreen(
     // invisible for the models that finish a step in under a second.
     var subLabel by remember { mutableStateOf("") }
     var subProgress by remember { mutableFloatStateOf(-1f) }
+    // Backend log panel. Polled from the on-disk mirror so it is there whether
+    // or not anything failed, and after the app has been killed and reopened.
+    var backendLog by remember { mutableStateOf("") }
+    var showBackendLog by remember { mutableStateOf(true) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var isCheckingBackend by remember { mutableStateOf(true) }
 
@@ -1742,6 +1747,18 @@ fun ModelRunScreen(
         return backendReady
     }
 
+    // Poll the backend log while this screen is up. A bounded file read, and
+    // the only diagnosis channel that still works when nothing throws: a
+    // wedged process raises no exception and a killed app reports nothing.
+    LaunchedEffect(Unit) {
+        while (true) {
+            backendLog = withContext(Dispatchers.IO) {
+                BackendService.persistedLog(context)
+            }
+            delay(1500)
+        }
+    }
+
     // Remote mode starts its health check only after /select has been sent
     // (in the hasInitialized effect); checking in parallel could see the host
     // still Ready on a previous model and race the switch.
@@ -2285,6 +2302,44 @@ fun ModelRunScreen(
                                     contentDescription = "Generation Preview",
                                     modifier = Modifier.fillMaxSize(),
                                     contentScale = ContentScale.Fit,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Backend log, never gated on an error firing. Rounds of
+            // diagnosis were lost to failures that produce no error at all:
+            // a wedged process throws nothing and a killed app takes its
+            // in-memory state with it. This reads the on-disk mirror.
+            if (backendLog.isNotEmpty()) {
+                ElevatedCard(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp),
+                    shape = MaterialTheme.shapes.large,
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                "Backend log",
+                                style = MaterialTheme.typography.titleSmall,
+                            )
+                            TextButton(onClick = { showBackendLog = !showBackendLog }) {
+                                Text(if (showBackendLog) "Hide" else "Show")
+                            }
+                        }
+                        if (showBackendLog) {
+                            SelectionContainer {
+                                Text(
+                                    backendLog,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
                             }
                         }
