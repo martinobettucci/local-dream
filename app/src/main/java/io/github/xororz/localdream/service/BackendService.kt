@@ -586,14 +586,19 @@ class BackendService : Service() {
             val systemLibPathsStr = systemLibPaths.joinToString(":")
             env["LD_LIBRARY_PATH"] = systemLibPathsStr
             env["DSP_LIBRARY_PATH"] = runtimeDir.absolutePath
-            // LOCALDREAM_ZIMAGE_SEQ_CLIP deliberately NOT set. Loading
-            // encoder contexts one at a time crashes the backend natively in
-            // the create/destroy churn -- the device report showed it dying
-            // mid power-config, the first thing context bring-up does. The
-            // co-resident path's memory problem is attacked in the pipeline
-            // instead (the encoder group no longer reserves the DiT-sized
-            // spill-fill buffer). The env var stays available over adb for
-            // experiments.
+            if (config.backendType == "zimage") {
+                // One encoder context at a time. Co-resident loading wedges at
+                // a hard per-process ceiling: twice measured, the 4th context
+                // (~1.9 GB mapped) never finishes -- with and without the
+                // spill-fill reservation, which only shifted the wall by one
+                // context. Six contexts is 3.7 GB and can never fit under it.
+                // The earlier "sequential crashes instantly" verdict was read
+                // from an unfiltered log tail on a backend a prior bug had
+                // already killed; with the restart, the watchdog and a
+                // readable tail all in place, whatever sequential loading
+                // actually does now gets reported in words.
+                env["LOCALDREAM_ZIMAGE_SEQ_CLIP"] = "1"
+            }
 
             Log.d(TAG, "COMMAND: ${command.joinToString(" ")}")
             Log.d(TAG, "DIR: $runtimeDir")

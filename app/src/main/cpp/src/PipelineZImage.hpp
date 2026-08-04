@@ -514,7 +514,10 @@ class PipelineZImage : public PipelineQnn {
                                                  mask.data(), dst);
       // Released before the failure check, so a part that fails does not stay
       // resident while the exception unwinds past the rest of the chain.
-      if (seqClip()) clip_parts_[i].reset();
+      if (seqClip()) {
+        clip_parts_[i].reset();
+        QNN_INFO("[clip-seq] part %zu released", i + 1);
+      }
       if (st != StatusCode::SUCCESS)
         throw std::runtime_error("Z-Image text encoder part " +
                                  std::to_string(i + 1) + " failed");
@@ -554,7 +557,12 @@ class PipelineZImage : public PipelineQnn {
     Qnn_ContextHandle_t head = nullptr;
     for (size_t i = 0; i < clip_part_paths_.size(); ++i) {
       // 3.6 GB of context binaries, and until this loop finishes nothing has
-      // reported progress even once. Say which one is being mapped.
+      // reported progress even once. Say which one is being mapped -- and
+      // leave a breadcrumb in the log, because this loop is where the device
+      // wedged twice (at the 4th context, ~1.9 GB mapped: a per-process DSP
+      // mapping ceiling, not swap pressure).
+      QNN_INFO("[clip] context %zu/%zu (co-resident)", i + 1,
+               clip_part_paths_.size());
       reportSub("Loading text encoder", (int)i, (int)clip_part_paths_.size());
       clip_parts_[i] =
           qnn_runtime::createModel(clip_part_paths_[i], clipTag(i).c_str());
@@ -671,11 +679,17 @@ class PipelineZImage : public PipelineQnn {
   // buffer (no group sharing -- the parts are never co-resident).
   void loadClipPartAlone(size_t i) {
     if (clip_parts_[i]) return;
+    // Breadcrumbs on both sides: if the process dies or wedges in here, the
+    // error tail's last line names the exact context and phase instead of
+    // whatever QNN happened to print last.
+    QNN_INFO("[clip-seq] part %zu/%zu: creating context", i + 1,
+             clip_part_paths_.size());
     clip_parts_[i] =
         qnn_runtime::createAndInitModel(clip_part_paths_[i], clipTag(i).c_str());
     if (!clip_parts_[i])
       throw std::runtime_error("[seq] Failed to load Z-Image text encoder part " +
                                std::to_string(i + 1));
+    QNN_INFO("[clip-seq] part %zu ready", i + 1);
   }
   void loadCapPartAlone() {
     if (cap_part_) return;
