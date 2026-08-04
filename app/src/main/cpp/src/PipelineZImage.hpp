@@ -440,7 +440,8 @@ class PipelineZImage : public PipelineQnn {
                          sample, timestep, cap_, pos_ids_.data(),
                          attn_mask_.data(), tokens, dit_state_,
                          terminal ? out : nullptr)
-                   : part->executeZImageDitNext(dit_state_, pos_ids_.data(),
+                   : part->executeZImageDitNext(dit_state_, cap_,
+                                                pos_ids_.data(),
                                                 attn_mask_.data(), tokens,
                                                 terminal ? out : nullptr);
       if (seq_dit_) releaseDitPart(i);

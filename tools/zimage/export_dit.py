@@ -37,27 +37,24 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 REPO = "Tongyi-MAI/Z-Image-Turbo"
 SUBDIR = "transformer"
 N_LAYERS = 30
+N_REFINER = 2
 CAP_SLOTS = 512
 LATENT = 128          # 1024 / 8
 DIM = 3840
 CAP_FEAT_DIM = 2560
 
-# Modules a part only needs when it owns the head or the tail of the model.
-FIRST_ONLY = ("all_x_embedder", "t_embedder", "noise_refiner")
+# Modules only the tail of the model owns.
 LAST_ONLY = ("all_final_layer",)
 # The caption branch, which is its own graph -- see CAP_INPUT_NAMES in
 # static_export.py for why. Its weights belong to no numbered part.
 CAP_ONLY = ("cap_embedder", "cap_pad_token", "context_refiner")
 
-# ...and the subset actually worth deleting on a part that will not trace them.
-# The two refiner stacks are two full-width blocks each, so at dim 3840 they are
-# a couple of GB of randomly-initialised fp32 that a part would otherwise carry
-# all the way through ONNX export. The rest are small, and deleting them only
-# creates ways for code that legitimately reads their shapes to fail:
-# StaticZImageDiT needs t_embedder's output width even on a part that never runs
-# it, because `emb` is one of that part's graph inputs.
-DROP_ON_MIDDLE = ("noise_refiner", "context_refiner")
-DROP_ON_FIRST = ("context_refiner",)
+# What the caption branch does not trace. Deleting before loading matters: a
+# refiner stack is two full-width blocks, so at dim 3840 it is a couple of GB of
+# randomly-initialised fp32 that would otherwise ride all the way through ONNX
+# export. Numbered parts compute their own drop list in build_part, from the
+# refiner range they were given rather than from where they sit -- with one
+# refiner block per graph, "not first" no longer implies "no refiner".
 DROP_ON_CAP = ("noise_refiner", "layers", "all_final_layer")
 
 
@@ -75,19 +72,32 @@ def plan_parts(n_parts, n_layers=N_LAYERS):
     embedder / final-layer work, so they get one fewer block where it divides
     unevenly.
 
-    n_parts == n_layers + 1 is the special case the shipped build uses: part 1
-    carries NO transformer block, only the image embedder and the noise
-    refiner, and every block gets a part of its own. That is not tidiness --
-    part 1 with a block as well needs >21 GB to quantize, because the image
-    refiner's 4096-token attention alone (2 layers, 4096^2, 30 heads, scores and
-    softmax both retained by the quantizer) is ~8 GB before the block's 4608^2
-    is counted. The block is the only piece of part 1 that can move; the caption
-    refiner moved too, into a graph of its own (see CAP_INPUT_NAMES).
+    Two counts above n_layers are special, and both exist because the head of
+    the model is expensive out of all proportion to its parameter count:
+
+      n_layers + 1  part 1 carries no transformer block, only the embedders and
+                    the whole noise refiner.
+      n_layers + 2  parts 1 and 2 carry no transformer block either, and take
+                    ONE noise-refiner block each. This is what the shipped
+                    build uses.
+
+    The measurements behind that, all on a 16 GB machine:
+
+      one transformer block, 4608 tokens      11.1 GB    builds
+      2 refiner blocks + a transformer block  >21 GB     OOM at quantize
+      2 refiner blocks (n_layers + 1 part 1)  15.97 GB   OOM at context binary
+      1 refiner block  (n_layers + 2)         ~11 GB     builds
+
+    A refiner block costs ~4.7 GB at context-binary generation -- 4096^2 x 30
+    heads of attention, with scores and softmax both retained -- so one per
+    graph is the only arrangement that fits. The caption refiner is not in this
+    list at all: it moved into a graph of its own (see CAP_INPUT_NAMES).
     """
-    if n_parts == n_layers + 1:
-        return [(0, 0)] + [(i, i + 1) for i in range(n_layers)]
+    if n_parts in (n_layers + 1, n_layers + 2):
+        head = n_parts - n_layers
+        return [(0, 0)] * head + [(i, i + 1) for i in range(n_layers)]
     if not 1 <= n_parts <= n_layers:
-        raise ValueError(f"n_parts must be in 1..{n_layers + 1}, got {n_parts}")
+        raise ValueError(f"n_parts must be in 1..{n_layers + 2}, got {n_parts}")
     base, extra = divmod(n_layers, n_parts)
     cuts, at = [], 0
     for i in range(n_parts):
@@ -103,6 +113,26 @@ def plan_parts(n_parts, n_layers=N_LAYERS):
 
 
 CAP_PART = "cap"
+
+
+def head_plan(n_parts, n_layers=N_LAYERS, n_refiner=N_REFINER):
+    """Per-part noise-refiner ranges, and which part does the concatenation.
+
+    The refiner runs on the image stream alone, so every refiner block must
+    precede the concatenation; the concatenation is what turns that stream into
+    the full sequence the transformer blocks need. So the concatenating part is
+    always the last one holding refiner blocks.
+    """
+    ref = [(0, 0)] * n_parts
+    if n_parts == n_layers + 2:
+        # One refiner block per graph -- the only arrangement that fits 16 GB.
+        for i in range(n_refiner):
+            ref[i] = (i, i + 1)
+        concat_at = n_refiner - 1
+    else:
+        ref[0] = (0, n_refiner)
+        concat_at = 0
+    return ref, concat_at
 
 
 def target_part(name, cuts):
@@ -126,7 +156,18 @@ def target_part(name, cuts):
         return n_parts - 1, name
     if name.startswith(CAP_ONLY):
         return CAP_PART, name
-    # everything else (image embedder, noise refiner, t_embedder) is part 1
+    # The noise refiner is split across the head parts exactly as the
+    # transformer blocks are across the rest, and renumbered the same way so
+    # each part loads into a model built with its own count.
+    m = re.match(r"noise_refiner\.(\d+)\.(.*)", name)
+    if m:
+        idx, rest = int(m.group(1)), m.group(2)
+        ref, _ = head_plan(len(cuts))
+        for pi, (a, b) in enumerate(ref):
+            if a <= idx < b:
+                return pi, f"noise_refiner.{idx - a}.{rest}"
+        raise KeyError(f"noise_refiner.{idx} outside {ref}")
+    # everything else (image embedder, t_embedder) is part 1
     return 0, name
 
 
@@ -168,15 +209,17 @@ def fetch_part_weights(readers, weight_map, cuts, pi, cache=None):
     return sd
 
 
-def new_model(n_blocks):
-    """A ZImageTransformer2DModel holding only `n_blocks` transformer blocks.
+def new_model(n_blocks, n_refiner=N_REFINER):
+    """A ZImageTransformer2DModel holding only this part's blocks and refiners.
 
-    n_blocks may be 0 -- part 1 of the shipped split carries none. The model is
-    still constructed with one and then emptied, rather than asked for zero:
-    the block list is built from the config before anything validates it, and a
-    config that claims zero layers is not something the reference class is
-    written to survive. One block's worth of randomly-initialised weights is
-    allocated and immediately freed, which costs a moment and nothing else.
+    Either count may be 0 -- parts 1 and 2 of the shipped split carry no
+    transformer block, and every part after them carries no refiner block. The
+    model is still constructed with one of each and then emptied, rather than
+    asked for zero: the module lists are built from the config before anything
+    validates it, and a config claiming zero layers is not something the
+    reference class is written to survive. One block's worth of
+    randomly-initialised weights is allocated and immediately freed, which costs
+    a moment and nothing else.
     """
     import rope_real
     rope_real.apply()
@@ -184,7 +227,7 @@ def new_model(n_blocks):
 
     model = ZImageTransformer2DModel(
         all_patch_size=[2], all_f_patch_size=[1], in_channels=16,
-        dim=DIM, n_layers=max(n_blocks, 1), n_refiner_layers=2,
+        dim=DIM, n_layers=max(n_blocks, 1), n_refiner_layers=max(n_refiner, 1),
         n_heads=30, n_kv_heads=30,
         norm_eps=1e-5, qk_norm=True, cap_feat_dim=CAP_FEAT_DIM,
         rope_theta=256.0, t_scale=1000.0,
@@ -240,7 +283,7 @@ def build_cap(sd):
     """The caption branch: cap_embedder + context_refiner, as its own graph."""
     from static_export import StaticZImageCaption
 
-    model = new_model(0)
+    model = new_model(0, N_REFINER)
     missing = load_in_place(model, sd, DROP_ON_CAP, "the caption branch")
     absent = [m for m in missing if m.startswith(CAP_ONLY)]
     if absent:
@@ -251,36 +294,47 @@ def build_cap(sd):
     return StaticZImageCaption(model, CAP_SLOTS, LATENT, LATENT)
 
 
-def build_part(sd, n_blocks, first, last):
+def build_part(sd, n_blocks, first, last, refiner=(0, N_REFINER), concat=None):
     """A reduced model holding only this part's blocks, then the static wrapper."""
     from static_export import StaticZImageDiT
 
-    model = new_model(n_blocks)
-    # A part that is not first traces neither refiner; part 1 now traces only
-    # the noise refiner, the caption branch having become its own graph.
-    missing = load_in_place(model, sd,
-                            DROP_ON_FIRST if first else DROP_ON_MIDDLE,
-                            f"part (blocks={n_blocks}, first={first})")
-    # `layers.*` is the one thing that must NEVER be missing: an absent block
-    # weight leaves that block randomly initialised, and the part then exports,
-    # converts, quantizes and compiles without complaint. An earlier version
-    # filtered these out of `missing` before checking anything, which is exactly
-    # backwards -- it silenced the only fatal case and kept the benign ones.
-    absent_blocks = [m for m in missing if m.startswith("layers.")]
+    n_ref = refiner[1] - refiner[0]
+    concat = first if concat is None else concat
+    model = new_model(n_blocks, n_ref)
+
+    # Drop by what the part actually runs, not by where it sits. The head is no
+    # longer "part 1 does everything": with one refiner block per graph, part 2
+    # is not `first` and still needs noise_refiner, while part 1 needs only one
+    # of its two blocks. context_refiner is never wanted here -- it belongs to
+    # the caption branch.
+    drop = ["context_refiner"] + ([] if n_ref else ["noise_refiner"])
+    missing = load_in_place(
+        model, sd, drop,
+        f"part (blocks={n_blocks}, refiner={n_ref}, first={first})")
+
+    # `layers.*` and `noise_refiner.*` are the things that must NEVER be
+    # missing: an absent block weight leaves that block randomly initialised,
+    # and the part then exports, converts, quantizes and compiles without
+    # complaint. An earlier version filtered these out of `missing` before
+    # checking anything, which is exactly backwards -- it silenced the only
+    # fatal case and kept the benign ones.
+    absent_blocks = [m for m in missing
+                     if m.startswith(("layers.", "noise_refiner."))]
     if absent_blocks:
         raise RuntimeError(
             f"part is missing {len(absent_blocks)} block weight(s), which would "
             f"export as random values: {absent_blocks[:5]}")
-    # A middle part legitimately lacks the embedders and the final layer -- it
-    # never traces them, and DROP_ON_MIDDLE has already deleted the big ones.
-    if first and any(m.startswith(FIRST_ONLY) for m in missing):
+    # A part that runs neither embedder nor final layer legitimately lacks both.
+    if first and any(m.startswith(("all_x_embedder", "t_embedder"))
+                     for m in missing):
         raise RuntimeError(f"part 1 is missing embedder weights: {missing[:5]}")
     if last and any(m.startswith(LAST_ONLY) for m in missing):
         raise RuntimeError(f"last part is missing the final layer: {missing[:5]}")
     model.eval()
     return StaticZImageDiT(model, CAP_SLOTS, LATENT, LATENT,
                            block_start=0, block_end=n_blocks,
-                           first=first, last=last)
+                           first=first, last=last,
+                           refiner=(0, n_ref), concat=concat)
 
 
 def export_part(part, path, dim=DIM):
@@ -352,7 +406,10 @@ def main():
 
     os.makedirs(args.work, exist_ok=True)
     cuts = plan_parts(args.parts)
+    ref_plan, concat_at = head_plan(args.parts)
     log(f"{args.parts} parts, block ranges {cuts}")
+    log(f"  noise refiner {[r for r in ref_plan if r[1] > r[0]]}, "
+        f"concatenation on part {concat_at + 1}")
     if args.plan_only:
         return
 
@@ -389,7 +446,10 @@ def main():
     manifest = []
     for pi, (a, b) in enumerate(cuts):
         n = pi + 1
-        entry = {"part": n, "blocks": [a, b]}
+        refiner = ref_plan[pi]
+        concat = pi == concat_at
+        entry = {"part": n, "blocks": [a, b], "refiner": list(refiner),
+                 "concat": concat}
         if args.only and n != args.only:
             manifest.append(entry)
             continue
@@ -401,7 +461,8 @@ def main():
         os.makedirs(pdir, exist_ok=True)
         out = os.path.join(pdir, f"unet_part{n}.onnx")
         first, last = pi == 0, pi == len(cuts) - 1
-        want_in = dit_input_names(first, b > a)
+        want_in = dit_input_names(first, b > a, concat,
+                                  refiner[1] > refiner[0])
         want_out = dit_output_names(first, last)
         if os.path.exists(out):
             # Re-check rather than trust it. Resuming is the normal way this
@@ -427,7 +488,8 @@ def main():
                              f"p{n}of{len(cuts)}.safetensors") \
             if args.cache_weights else None
         sd = fetch_part_weights(readers, weight_map, cuts, pi, cache=cache)
-        part = build_part(sd, b - a, first=first, last=last)
+        part = build_part(sd, b - a, first=first, last=last,
+                          refiner=refiner, concat=concat)
         del sd
         gc.collect()
         log(f"  exporting -> {out}")

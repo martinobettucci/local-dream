@@ -52,7 +52,7 @@ CAP_INPUT_NAMES = ["context", "pos_ids", "attn_mask", "cap_pad_mask"]
 CAP_OUTPUT_NAMES = ["cap"]
 
 
-def dit_input_names(first, has_blocks=True):
+def dit_input_names(first, has_blocks=True, concat=False, has_refiner=None):
     """The graph IO contract, as free functions so it can be checked without
     building a part -- the resume path has an ONNX on disk and no model.
 
@@ -61,16 +61,27 @@ def dit_input_names(first, has_blocks=True):
     "hidden.1", which the app -- which binds by name -- would only discover on
     device. Matches kZImageStateInNames in QnnModel.hpp.
 
-    `attn_mask` is absent from a block-less first part, which is what the
-    shipped 31-way split produces. It would be an input no operation reads, and
-    the converter drops those -- so declaring it would only mean the app looks
-    for a tensor the graph does not have. The mask still reaches the caption
-    refiner: that is now the separate graph above.
+    `cap`, `pos_ids` and `attn_mask` are present only on the graphs that read
+    them, and the runner binds all three by presence for the same reason: the
+    converter drops inputs no operation reads, so declaring one anyway would
+    only mean the app looking for a tensor the graph does not have.
+
+      `cap`        whichever graph performs the concatenation.
+      `pos_ids`    any graph running a refiner or transformer block; RoPE
+                   frequencies are gathered from the baked tables by it, so a
+                   graph running neither never touches it.
+      `attn_mask`  any graph running a transformer block. The noise refiner is
+                   unmasked -- every image token is real.
+
+    `has_refiner` defaults to `first`, which is true of every split where the
+    head is one graph.
     """
-    if not first:
-        return ["hidden_in", "emb", "pos_ids", "attn_mask"]
-    return ["sample", "timestep", "cap", "pos_ids"] + \
-        (["attn_mask"] if has_blocks else [])
+    if has_refiner is None:
+        has_refiner = first
+    head = ["sample", "timestep"] if first else ["hidden_in", "emb"]
+    return (head + (["cap"] if concat else [])
+            + (["pos_ids"] if (has_refiner or has_blocks) else [])
+            + (["attn_mask"] if has_blocks else []))
 
 
 def dit_output_names(first, last):
@@ -110,13 +121,31 @@ def build_positions(true_len, cap_slots, grid_h, grid_w, seq_multiple=32):
 class StaticZImageDiT(nn.Module):
     """One exportable piece of the DiT.
 
-    `first` runs the embedders and refiners and emits the residual stream;
-    `last` runs the final layer and unpatchifies. Both may be true (N = 1).
+    A piece is described by four independent things, because the model has two
+    streams and the cut can land anywhere in either:
+
+      `first`        runs t_embedder and the image embedder, so it takes
+                     `sample`/`timestep` rather than `hidden_in`/`emb`, and
+                     emits `emb` for the rest of the chain.
+      `refiner`      which noise_refiner blocks it runs. These operate on the
+                     IMAGE stream only (n_img tokens), so they must all come
+                     before the concatenation.
+      `concat`       whether it appends `cap` -- the caption branch's output --
+                     turning the n_img stream into the full T-token one.
+      `block_start`  which transformer blocks it runs. These need the full
+      `block_end`    stream, so they only ever follow the concatenation.
+      `last`         runs the final layer and unpatchifies.
+
+    All of them may be true at once (N = 1, the whole DiT in one graph); the
+    shipped split spreads them over 32 graphs plus the caption branch, because
+    each refiner block over 4096 tokens costs ~4.7 GB at context-binary
+    generation and two of them in one graph is 15.97 GB -- an OOM kill on a
+    16 GB machine, measured twice.
     """
 
     def __init__(self, model, cap_slots, latent_h, latent_w,
                  block_start=0, block_end=None, patch=2, f_patch=1,
-                 first=None, last=None):
+                 first=None, last=None, refiner=None, concat=None):
         super().__init__()
         self.m = model
         self.key = f"{patch}-{f_patch}"
@@ -146,23 +175,48 @@ class StaticZImageDiT(nn.Module):
         self.last = (self.block_end == n_layers) if last is None else bool(last)
         self.has_blocks = self.block_end > self.block_start
 
-        # An EMPTY range is legal for the first part and only for it. At the
-        # shipped 31-way split part 1 carries no transformer block at all --
-        # just the image embedder, the noise refiner and the concatenation --
-        # because those alone are as much as the converting machine can hold.
-        # Everywhere else an empty range means the plan lost a block, which
-        # would export a graph that quietly skips it.
+        # Defaults describe the WHOLE model in one graph: it runs every refiner
+        # block it holds and does the concatenation itself. A split states its
+        # own share; nothing is inferred from the block range, because a piece
+        # built as a reduced model cannot tell where it sits from its own shape.
+        n_ref = len(getattr(model, "noise_refiner", ()))
+        self.ref_start, self.ref_end = (0, n_ref) if refiner is None else \
+            (int(refiner[0]), int(refiner[1]))
+        self.concat = self.first if concat is None else bool(concat)
+        self.has_refiner = self.ref_end > self.ref_start
+
         if not (0 <= self.block_start <= self.block_end <= n_layers):
             raise ValueError(f"bad block range [{block_start}, {block_end}) "
                              f"of {n_layers}")
-        if not self.has_blocks and not self.first:
+        if not (0 <= self.ref_start <= self.ref_end <= n_ref):
+            raise ValueError(f"bad refiner range [{self.ref_start}, "
+                             f"{self.ref_end}) of {n_ref}")
+        # A graph must DO something. An empty block range is fine on its own --
+        # the shipped part 1 and part 2 carry no transformer block, only the
+        # embedders and one refiner block each -- but a piece with no blocks, no
+        # refiner, no concatenation and no final layer is a plan that lost work,
+        # and it would export and run without complaint.
+        if not (self.has_blocks or self.has_refiner or self.concat or self.last):
             raise ValueError(
-                f"empty block range [{block_start}, {block_end}) on a part that "
-                f"is not the first; only part 1 may carry no blocks")
-
-        empty_ok = self.first and self.block_start == self.block_end
-        if not (empty_ok or 0 <= self.block_start < self.block_end <= n_layers):
-            raise ValueError(f"bad block range [{block_start}, {block_end}) of {n_layers}")
+                f"part [{block_start}, {block_end}) runs no refiner block, no "
+                f"transformer block, no concatenation and no final layer")
+        # A part whose only job is the concatenation is worse than useless: it
+        # reads nothing but `hidden_in` and `cap`, so the converter drops `emb`
+        # and `pos_ids` as unread and the graph stops matching the contract --
+        # and the work it does is a memcpy the runner could do itself.
+        if not (self.first or self.has_refiner or self.has_blocks or self.last):
+            raise ValueError(
+                "a part that only concatenates is not worth a context binary; "
+                "give it the refiner block that precedes the concatenation")
+        # Transformer blocks need the full T-token stream, which only exists
+        # after the concatenation. A part that has blocks must therefore either
+        # do the concatenation itself or follow one that did -- and the one case
+        # this can catch locally is the part that does both in the wrong order.
+        if self.has_blocks and self.has_refiner and not self.concat:
+            raise ValueError(
+                "a part running both refiner and transformer blocks must also "
+                "concatenate: the refiner works on image tokens, the blocks on "
+                "the full sequence")
 
         # Checked here rather than up front because a middle part has neither
         # module: export_dit.py deletes them before loading so a 2-block part
@@ -203,45 +257,43 @@ class StaticZImageDiT(nn.Module):
         x = x.reshape(1, c * p * p, self.grid_h, self.grid_w)
         return torch.nn.functional.pixel_shuffle(x, p)       # [1, C, H, W]
 
-    def _embed(self, sample, timestep, cap, freqs):
-        """Everything part 1 does before the main blocks.
-
-        The caption half of this used to live here too. It is now its own graph
-        (StaticZImageCaption) and arrives as `cap`, already refined -- see the
-        note on CAP_INPUT_NAMES. The concatenation stays on this side because
-        the residual stream has to be built somewhere, and building it here
-        keeps the handoff between parts a single tensor.
-        """
-        m = self.m
-        # `timestep` is already sigma * t_scale (the value t_embedder consumes);
-        # the stock forward multiplies by t_scale itself, we do not.
-        emb = m.t_embedder(timestep)
-
-        img_freqs = freqs[:, :self.n_img]
-        x = m.all_x_embedder[self.key](self._patchify(sample))
-        for layer in m.noise_refiner:
-            x = layer(x, None, img_freqs, emb)
-
-        return torch.cat([x, cap], dim=1), emb
-
     # -- forward -----------------------------------------------------------
     def forward(self, *args):
-        if self.first:
-            if self.has_blocks:
-                sample, timestep, cap, pos_ids, attn_mask = args
-            else:
-                sample, timestep, cap, pos_ids = args
-                attn_mask = None
-        else:
-            hidden, emb, pos_ids, attn_mask = args
+        # Bound by name against this part's own contract rather than unpacked
+        # positionally: the contract varies along four axes now, and a
+        # positional unpack that silently shifts by one is exactly the kind of
+        # error that survives every stage and shows up as a wrong image.
+        kw = dict(zip(self.input_names, args))
+        pos_ids = kw.get("pos_ids")
+        attn_mask = kw.get("attn_mask")
 
         # RoPE frequencies are gathered from the baked tables by pos_ids, so the
-        # tables stay constant while the coordinates stay prompt-dependent.
-        freqs = self.m.rope_embedder(pos_ids.reshape(-1, 3)).unsqueeze(0)
+        # tables stay constant while the coordinates stay prompt-dependent. A
+        # part that runs neither a refiner nor a transformer block has no
+        # attention to rotate and never asks for them.
+        freqs = None if pos_ids is None else \
+            self.m.rope_embedder(pos_ids.reshape(-1, 3)).unsqueeze(0)
         mask = None if attn_mask is None else attn_mask > 0.5
+        m = self.m
 
         if self.first:
-            hidden, emb = self._embed(sample, timestep, cap, freqs)
+            # `timestep` is already sigma * t_scale (the value t_embedder
+            # consumes); the stock forward multiplies by t_scale itself, we do
+            # not.
+            emb = m.t_embedder(kw["timestep"])
+            hidden = m.all_x_embedder[self.key](self._patchify(kw["sample"]))
+        else:
+            hidden, emb = kw["hidden_in"], kw["emb"]
+
+        # The noise refiner is unmasked in the reference and stays unmasked
+        # here: every image token is real.
+        if self.has_refiner:
+            img_freqs = freqs[:, :self.n_img]
+            for layer in m.noise_refiner[self.ref_start:self.ref_end]:
+                hidden = layer(hidden, None, img_freqs, emb)
+
+        if self.concat:
+            hidden = torch.cat([hidden, kw["cap"]], dim=1)
 
         for layer in self.m.layers[self.block_start:self.block_end]:
             hidden = layer(hidden, mask, freqs, emb)
@@ -255,7 +307,8 @@ class StaticZImageDiT(nn.Module):
     # -- export metadata ---------------------------------------------------
     @property
     def input_names(self):
-        return dit_input_names(self.first, self.has_blocks)
+        return dit_input_names(self.first, self.has_blocks, self.concat,
+                               self.has_refiner)
 
     @property
     def emb_dim(self):
@@ -289,12 +342,15 @@ class StaticZImageDiT(nn.Module):
         attn = attn.unsqueeze(0)
         if self.first:
             head = (torch.randn(1, self.C, self.H, self.W),
-                    torch.tensor([1000.0]),
-                    torch.randn(1, self.cap_slots, dim),
-                    pos)
-            return head + ((attn,) if self.has_blocks else ())
-        total = self.n_img + self.cap_slots
-        return (torch.randn(1, total, dim), torch.randn(1, self.emb_dim), pos, attn)
+                    torch.tensor([1000.0]))
+        else:
+            # The incoming stream is n_img tokens wide until something
+            # concatenates the caption onto it, and T wide afterwards.
+            n_in = self.n_img if self.concat else self.n_img + self.cap_slots
+            head = (torch.randn(1, n_in, dim), torch.randn(1, self.emb_dim))
+        mid = (torch.randn(1, self.cap_slots, dim),) if self.concat else ()
+        tail = ((pos,) if (self.has_refiner or self.has_blocks) else ())
+        return head + mid + tail + ((attn,) if self.has_blocks else ())
 
 
 class StaticZImageCaption(nn.Module):

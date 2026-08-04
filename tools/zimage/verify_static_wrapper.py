@@ -33,6 +33,7 @@ CAP_SLOTS = 512
 LAT = 16          # latent edge -> 8x8 = 64 image tokens (a multiple of 32)
 DIM = 384        # > 256 so dim != emb_dim, as in the real model
 N_LAYERS = 6
+N_REF = 2         # as in the real model: one refiner block per head graph
 T_SCALE = 1000.0
 
 
@@ -40,7 +41,7 @@ def build():
     torch.manual_seed(0)
     return ZImageTransformer2DModel(
         all_patch_size=[2], all_f_patch_size=[1], in_channels=16,
-        dim=DIM, n_layers=N_LAYERS, n_refiner_layers=1, n_heads=3, n_kv_heads=3,
+        dim=DIM, n_layers=N_LAYERS, n_refiner_layers=N_REF, n_heads=3, n_kv_heads=3,
         norm_eps=1e-5, qk_norm=True, cap_feat_dim=32,
         rope_theta=256.0, t_scale=T_SCALE,
         # head_dim = 384/3 = 128 = 32+48+48, the real model's RoPE split
@@ -71,13 +72,39 @@ def raw_inputs(true_len, cap_feat, cap_feat_dim, sigma, sample):
             pos.unsqueeze(0), attn.unsqueeze(0), cap_pad.unsqueeze(0))
 
 
-def dit_args(part, capgraph, raw):
-    """The caption branch's output plus whatever part 1's contract asks for."""
-    sample, timestep, context, pos, attn, cap_pad = raw
+def refined_caption(capgraph, raw):
     with torch.no_grad():
-        cap = capgraph(context, pos, attn, cap_pad)
-    head = (sample, timestep, cap, pos)
-    return head + ((attn,) if part.has_blocks else ())
+        return capgraph(raw[2], raw[3], raw[4], raw[5])
+
+
+def graph_args(part, raw, cap, hidden=None, emb=None):
+    """Exactly the tensors this part's contract names, in its order."""
+    head = (raw[0], raw[1]) if part.first else (hidden, emb)
+    return (head + ((cap,) if part.concat else ())
+            + (raw[3],) + ((raw[4],) if part.has_blocks else ()))
+
+
+def chain(parts, raw, cap):
+    """Run a split chain and return its final output."""
+    hidden = emb = None
+    with torch.no_grad():
+        for p in parts:
+            r = p(*graph_args(p, raw, cap, hidden, emb))
+            if p.last:
+                return r
+            if isinstance(r, tuple):
+                hidden, emb = r
+            else:
+                hidden = r
+    raise AssertionError("chain has no terminal part")
+
+
+def make_parts(model, cuts, refiner, concat_at):
+    n = len(cuts) - 1
+    return [StaticZImageDiT(model, CAP_SLOTS, LAT, LAT, a, b,
+                            first=(i == 0), last=(i == n - 1),
+                            refiner=refiner[i], concat=(i == concat_at))
+            for i, (a, b) in enumerate(zip(cuts[:-1], cuts[1:]))]
 
 
 def report(tag, a, b, tol=1e-4):
@@ -107,42 +134,46 @@ if __name__ == "__main__":
         cap_feat = torch.randn(true_len, 32)
         ref = reference(model, sample.reshape(16, 1, LAT, LAT), sigma, cap_feat)
         raw = raw_inputs(true_len, cap_feat, 32, sigma, sample)
+        cap = refined_caption(capgraph, raw)
         with torch.no_grad():
-            got = whole(*dit_args(whole, capgraph, raw))
+            got = whole(*graph_args(whole, raw, cap))
         ok &= report(f"prompt {true_len} tok", ref, got)
 
     print("\n2. split chain vs single piece")
     cap_feat = torch.randn(40, 32)
     raw = raw_inputs(40, cap_feat, 32, sigma, sample)
+    cap = refined_caption(capgraph, raw)
     with torch.no_grad():
-        single = whole(*dit_args(whole, capgraph, raw))
-    # The last plan is the shape the shipped build uses: part 1 owns no block,
-    # so `has_blocks` is false and it declares no attn_mask. It is checked here
-    # rather than only in production because a block-less part is exactly the
-    # case an off-by-one in the plan would produce silently.
-    plans = ([0, 2, 4, N_LAYERS],
-             [0, 1, 2, 3, 4, 5, N_LAYERS],
-             [0, N_LAYERS],
-             [0, 0, 1, 2, 3, 4, 5, N_LAYERS])
-    for cuts in plans:
-        parts = [StaticZImageDiT(model, CAP_SLOTS, LAT, LAT, a, b,
-                                 first=(i == 0), last=(i == len(cuts) - 2))
-                 for i, (a, b) in enumerate(zip(cuts[:-1], cuts[1:]))]
-        args = dit_args(parts[0], capgraph, raw)
-        with torch.no_grad():
-            out = parts[0](*args)
-            if len(parts) == 1:
-                chained = out
-            else:
-                hidden, emb = out
-                for p in parts[1:]:
-                    r = p(hidden, emb, raw[3], raw[4])
-                    if p.last:
-                        chained = r
-                    else:
-                        hidden = r
-        blockless = " (block-less part 1)" if cuts[0] == cuts[1] else ""
-        ok &= report(f"{len(parts)}-way split {cuts}{blockless}", single, chained)
+        single = whole(*graph_args(whole, raw, cap))
+    # Each entry is (block cuts, per-part refiner ranges, which part
+    # concatenates). The last two are the shapes production uses: a block-less
+    # part 1 holding the whole refiner, and then the shipped one where parts 1
+    # and 2 hold one refiner block each and part 2 concatenates. Both are
+    # checked here rather than only in production, because a head part is
+    # exactly what an off-by-one in the plan would break silently.
+    plans = [
+        ([0, 2, 4, N_LAYERS], None, 0),
+        ([0, 1, 2, 3, 4, 5, N_LAYERS], None, 0),
+        ([0, N_LAYERS], None, 0),
+        ([0, 0, 1, 2, 3, 4, 5, N_LAYERS], None, 0),
+    ]
+    for cuts, refiner, concat_at in plans:
+        n = len(cuts) - 1
+        refiner = refiner or [(0, N_REF)] + [(0, 0)] * (n - 1)
+        parts = make_parts(model, cuts, refiner, concat_at)
+        chained = chain(parts, raw, cap)
+        note = " (block-less part 1)" if cuts[0] == cuts[1] else ""
+        ok &= report(f"{n}-way split {cuts}{note}", single, chained)
+
+    # The shipped shape exactly: one refiner block per head graph, the second
+    # of them doing the concatenation, and one transformer block per part after
+    # that. This is the arrangement that fits 16 GB, so it is the one that has
+    # to be right.
+    cuts = [0, 0] + list(range(N_LAYERS + 1))
+    refiner = [(0, 1), (1, 2)] + [(0, 0)] * N_LAYERS
+    parts = make_parts(model, cuts, refiner, concat_at=1)
+    ok &= report(f"{len(cuts) - 1}-way split, one refiner block per head part",
+                 single, chain(parts, raw, cap))
 
     print("\n3. ONNX export + onnxruntime agreement")
     try:
@@ -152,20 +183,16 @@ if __name__ == "__main__":
         ort = None
 
     if ort is not None:
-        cuts = [0, 0, 3, N_LAYERS]
-        graphs = [capgraph] + [
-            StaticZImageDiT(model, CAP_SLOTS, LAT, LAT, a, b,
-                            first=(i == 0), last=(i == len(cuts) - 2))
-            for i, (a, b) in enumerate(zip(cuts[:-1], cuts[1:]))]
+        cuts = [0, 0, 0, 3, N_LAYERS]
+        refiner = [(0, 1), (1, 2), (0, 0), (0, 0)]
+        graphs = [capgraph] + make_parts(model, cuts, refiner, concat_at=1)
         with tempfile.TemporaryDirectory() as td:
             hidden = emb = None
             for i, part in enumerate(graphs):
                 if part is capgraph:
                     inputs = (raw[2], raw[3], raw[4], raw[5])
-                elif getattr(part, "first", False):
-                    inputs = dit_args(part, capgraph, raw)
                 else:
-                    inputs = (hidden, emb, raw[3], raw[4])
+                    inputs = graph_args(part, raw, cap, hidden, emb)
                 path = os.path.join(td, f"graph{i}.onnx")
                 torch.onnx.export(
                     part, inputs, path, opset_version=17, dynamo=False,

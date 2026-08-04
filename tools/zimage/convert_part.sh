@@ -71,43 +71,64 @@ if bin_ok "$OUT/$STEM.bin"; then say "already built, skipping"; exit 0; fi
 rm -f "$OUT/$STEM.bin"   # present but too small: a dead run, not a result
 : > "$TSV"
 
-say "1/5 export ONNX"
-run export "$PY" "$SCRATCH/export_dit.py" --work "$W" --parts "$NPARTS" "${EXPORT_ARGS[@]}"
-[ -f "$ODIR/$STEM.onnx" ] || { echo "export produced no ONNX"; exit 1; }
-say "2/5 ONNX built"
-
-# Calibration inputs are read off the ONNX (names, shapes and dtypes have to
-# match exactly) and therefore built while it still exists. They are NOT random:
-# make_calib.py gives timestep, pos_ids and the masks their real runtime
-# distributions, because the quantizer derives every activation's range from
-# these and a wrong one produces a model that runs and generates garbage.
-# ONE sample: qairt-quantizer holds activations for every sample and OOM-killed
-# a 15 GB box with four.
+# Resume from the furthest intermediate still on disk, rather than from the
+# start. The stages are minutes to half an hour each and the box this runs on is
+# ephemeral, so a run that dies after the DLC and then re-exports and
+# re-converts is throwing away 40 minutes -- and, worse, needs the old DLC, a
+# fresh ONNX and a fresh DLC resident at once, which is how the converter runs
+# out of disk and reports success anyway.
 #
-# Run with $PY, not $QNN: the positions come from static_export.build_positions,
-# the same function the export uses and the C++ mirrors, so it needs torch. That
-# is deliberate -- reimplementing the coordinate arithmetic here in numpy would
-# be a second source of truth for the one piece of this pipeline whose earlier
-# divergence measured 15.6 % error.
-"$PY" "$SCRATCH/make_calib.py" "$ODIR/$STEM.onnx" "$W/calib$N" "$W/calib$N.txt"
+# The gate is presence, not integrity: a DLC truncated by a kill mid-write is
+# accepted here and rejected loudly by the next stage, which is the right place
+# for it. What must not be skipped on a resume is the calibration list -- it is
+# built from the ONNX, which the DLC stage deletes -- so a DLC without its
+# calibration is treated as no DLC at all.
+have_dlc() { [ -s "$W/$STEM.dlc" ] && [ -s "$W/calib$N.txt" ]; }
 
-# Never pipe a stage through tail: the pipeline's exit status is tail's, so a
-# failed converter looks like success under `set -e`. Log in full, then verify
-# the artifact actually exists before deleting anything upstream of it — an
-# earlier version reported "INFO_CONVERSION_SUCCESS" while writing no DLC, and
-# had already destroyed the fp16 source by then. That turned out to be how
-# qairt-converter reports running out of disk.
-run convert "$QNN" "$BIN/qairt-converter" --input_network "$ODIR/$STEM.onnx" \
-    --output_path "$W/$STEM.dlc" --preserve_io_datatype \
-    > "$W/convert$N.log" 2>&1 \
-    || { echo "convert FAILED:"; tail -20 "$W/convert$N.log"; exit 1; }
-if [ ! -s "$W/$STEM.dlc" ]; then
-    echo "converter exited 0 but produced no DLC (free $(free_gb)G) — last lines:"
-    tail -20 "$W/convert$N.log"; exit 1
+if [ -s "$W/${STEM}_q.dlc" ]; then
+  say "1-4/5 quantized DLC already on disk, resuming at the context binary"
+elif have_dlc; then
+  say "1-3/5 float DLC and calibration already on disk, resuming at quantize"
+else
+  say "1/5 export ONNX"
+  run export "$PY" "$SCRATCH/export_dit.py" --work "$W" --parts "$NPARTS" "${EXPORT_ARGS[@]}"
+  [ -f "$ODIR/$STEM.onnx" ] || { echo "export produced no ONNX"; exit 1; }
+  say "2/5 ONNX built"
+
+  # Calibration inputs are read off the ONNX (names, shapes and dtypes have to
+  # match exactly) and therefore built while it still exists. They are NOT
+  # random: make_calib.py gives timestep, pos_ids and the masks their real
+  # runtime distributions, because the quantizer derives every activation's
+  # range from these and a wrong one produces a model that runs and generates
+  # garbage. ONE sample: qairt-quantizer holds activations for every sample and
+  # OOM-killed a 15 GB box with four.
+  #
+  # Run with $PY, not $QNN: the positions come from
+  # static_export.build_positions, the same function the export uses and the C++
+  # mirrors, so it needs torch. That is deliberate -- reimplementing the
+  # coordinate arithmetic here in numpy would be a second source of truth for
+  # the one piece of this pipeline whose earlier divergence measured 15.6 %
+  # error.
+  "$PY" "$SCRATCH/make_calib.py" "$ODIR/$STEM.onnx" "$W/calib$N" "$W/calib$N.txt"
+
+  # Never pipe a stage through tail: the pipeline's exit status is tail's, so a
+  # failed converter looks like success under `set -e`. Log in full, then verify
+  # the artifact actually exists before deleting anything upstream of it — an
+  # earlier version reported "INFO_CONVERSION_SUCCESS" while writing no DLC, and
+  # had already destroyed the fp16 source by then. That turned out to be how
+  # qairt-converter reports running out of disk.
+  run convert "$QNN" "$BIN/qairt-converter" --input_network "$ODIR/$STEM.onnx" \
+      --output_path "$W/$STEM.dlc" --preserve_io_datatype \
+      > "$W/convert$N.log" 2>&1 \
+      || { echo "convert FAILED:"; tail -20 "$W/convert$N.log"; exit 1; }
+  if [ ! -s "$W/$STEM.dlc" ]; then
+      echo "converter exited 0 but produced no DLC (free $(free_gb)G) — last lines:"
+      tail -20 "$W/convert$N.log"; exit 1
+  fi
+  # Only now is the ONNX redundant.
+  rm -rf "$ODIR"
+  say "3/5 DLC built, ONNX released"
 fi
-# Only now is the ONNX redundant.
-rm -rf "$ODIR"
-say "3/5 DLC built, ONNX released"
 
 # DO NOT add --pack_4_bit_weights. It is tempting -- it halves the DLC, from
 # 181,246,412 to 90,806,732 bytes on this part, by switching the weight tensor
@@ -139,11 +160,13 @@ say "3/5 DLC built, ONNX released"
 # All three runnable widths are the same size on disk. w4 is kept over w8 for
 # the documented VTCM latency benefit, not for bytes; switch to 8 if quality
 # turns out to be the binding problem, at no size cost.
-run quantize "$QNN" "$BIN/qairt-quantizer" --input_dlc "$W/$STEM.dlc" \
-    --output_dlc "$W/${STEM}_q.dlc" --input_list "$W/calib$N.txt" \
-    --weights_bitwidth "$WBITS" --act_bitwidth 16 --bias_bitwidth 32 \
-    > "$W/quant$N.log" 2>&1 || { echo "quantize FAILED:"; tail -20 "$W/quant$N.log"; exit 1; }
-[ -s "$W/${STEM}_q.dlc" ] || { echo "no quantized DLC:"; tail -20 "$W/quant$N.log"; exit 1; }
+if [ ! -s "$W/${STEM}_q.dlc" ]; then
+  run quantize "$QNN" "$BIN/qairt-quantizer" --input_dlc "$W/$STEM.dlc" \
+      --output_dlc "$W/${STEM}_q.dlc" --input_list "$W/calib$N.txt" \
+      --weights_bitwidth "$WBITS" --act_bitwidth 16 --bias_bitwidth 32 \
+      > "$W/quant$N.log" 2>&1 || { echo "quantize FAILED:"; tail -20 "$W/quant$N.log"; exit 1; }
+  [ -s "$W/${STEM}_q.dlc" ] || { echo "no quantized DLC:"; tail -20 "$W/quant$N.log"; exit 1; }
+fi
 rm -f "$W/$STEM.dlc"; rm -rf "$W/calib$N"
 say "4/5 quantized w${WBITS}a16, float DLC released"
 
