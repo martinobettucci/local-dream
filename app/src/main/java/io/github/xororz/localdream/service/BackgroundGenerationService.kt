@@ -50,7 +50,7 @@ class BackgroundGenerationService : Service() {
 
         // Longest tolerated silence between SSE events before the backend is
         // declared stalled. See the watchdog note at the request site.
-        private const val STALL_LIMIT_S = 300L
+        private const val STALL_LIMIT_S = 180L
         const val LOCAL_BACKEND_HOST = "localhost:8081"
 
         // Shared across generations; the long timeouts cover a single SDXL
