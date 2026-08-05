@@ -56,13 +56,13 @@ class BackendService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + backendDispatcher)
 
     companion object {
-        private const val LOG_TAIL_LINES = 80
+        private const val LOG_TAIL_LINES = 400
         private const val LOG_FILE = "backend_last.log"
         private const val LOG_FILE_MAX_BYTES = 256L * 1024
 
         /** The persisted tail, which survives the app being killed. Falls back
          * to the in-memory ring when the file is missing. */
-        fun persistedLog(context: Context, maxLines: Int = 60): String = try {
+        fun persistedLog(context: Context, maxLines: Int = 120): String = try {
             val f = File(context.filesDir, LOG_FILE)
             if (f.exists()) f.readLines().takeLast(maxLines).joinToString("\n")
             else logTail(maxLines)
@@ -72,7 +72,7 @@ class BackendService : Service() {
         private val recentLog = ArrayDeque<String>()
 
         /** Last lines the backend printed, newest last. Empty if it never ran. */
-        fun logTail(maxLines: Int = 25): String = synchronized(recentLog) {
+        fun logTail(maxLines: Int = 40): String = synchronized(recentLog) {
             recentLog.takeLast(maxLines).joinToString("\n")
         }
 
@@ -658,17 +658,23 @@ class BackendService : Service() {
         }
     }
 
+    // QNN's DSP and HTP loggers emit thousands of lines per context at INFO,
+    // VERBOSE and WARNING -- power configs, "Alloc2 Support", status 0x0
+    // successes -- and they evict whatever named the failure within
+    // milliseconds. Only their ERRORS carry blame.
+    //
+    // Matched on the SEVERITY TAG, not on the bracket spelling: the real
+    // format is "[  INFO ]" with two spaces, and the first filter, written
+    // against "[ INFO ]", matched nothing at all -- which is exactly why the
+    // first log a user could read was sixty lines of noise. Lines from this
+    // app's own logger carry no Qnn tag and are always kept.
+    private fun isQnnNoise(line: String): Boolean {
+        if (!line.contains("Qnn")) return false
+        return line.contains("<I>") || line.contains("<V>") || line.contains("<W>")
+    }
+
     private fun rememberLogLine(line: String) {
-        // QNN's DSP layer prints thousands of INFO/VERBOSE lines (power
-        // configs, graph setup) that would evict the one line naming a crash
-        // within milliseconds. Keep the ring for lines that can carry blame:
-        // errors, warnings, and the backend's own prints. The full stream
-        // still goes to logcat above.
-        if (line.contains("[ INFO ] Qnn") || line.contains("[VERBOSE]") ||
-            line.contains("[ DEBUG ]")
-        ) {
-            return
-        }
+        if (isQnnNoise(line)) return
         synchronized(recentLog) {
             recentLog.addLast(line)
             while (recentLog.size > LOG_TAIL_LINES) recentLog.removeFirst()
