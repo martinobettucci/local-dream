@@ -4,6 +4,7 @@ import android.app.*
 import android.content.Context
 import android.content.Intent
 import android.os.IBinder
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import io.github.xororz.localdream.BuildConfig
@@ -599,6 +600,13 @@ class BackendService : Service() {
             val systemLibPathsStr = systemLibPaths.joinToString(":")
             env["LD_LIBRARY_PATH"] = systemLibPathsStr
             env["DSP_LIBRARY_PATH"] = runtimeDir.absolutePath
+            // Cut the log flood at the source. At the default INFO level the
+            // QNN DSP layer prints thousands of lines per context into the
+            // pipe this app drains, and a pipe that is not drained fast enough
+            // blocks the WRITER: the backend freezes mid-load, alive, silent
+            // and making no progress -- the exact reported symptom. The app's
+            // own progress breadcrumbs log at ERROR so they still come through.
+            command += listOf("--log_level", "error")
             if (config.backendType == "zimage") {
                 // One encoder context at a time. Co-resident loading wedges at
                 // a hard per-process ceiling: twice measured, the 4th context
@@ -645,16 +653,40 @@ class BackendService : Service() {
     // Mirror of the ring on disk. The in-memory tail dies with the process,
     // and an app that is killed is exactly the failure we cannot otherwise
     // observe -- so every kept line is appended here and the UI reads the file.
+    private var logWriter: java.io.BufferedWriter? = null
+    private var logBytes = 0L
+    private var lastFlushAt = 0L
+
     private fun appendToLogFile(line: String) {
         try {
-            val f = File(filesDir, LOG_FILE)
-            if (f.length() > LOG_FILE_MAX_BYTES) {
+            var w = logWriter
+            if (w == null) {
+                val f = File(filesDir, LOG_FILE)
+                logBytes = f.length()
+                w = f.bufferedWriter(bufferSize = 16 * 1024).also { logWriter = it }
+            }
+            if (logBytes > LOG_FILE_MAX_BYTES) {
+                // Rotate rarely and cheaply: close, keep the tail, reopen.
+                w.flush(); w.close(); logWriter = null
+                val f = File(filesDir, LOG_FILE)
                 val keep = f.readLines().takeLast(LOG_TAIL_LINES)
                 f.writeText(keep.joinToString("\n") + "\n")
+                logBytes = f.length()
+                w = f.bufferedWriter(bufferSize = 16 * 1024).also { logWriter = it }
             }
-            f.appendText(line + "\n")
+            w.write(line); w.newLine()
+            logBytes += line.length + 1
+            // Flush on a timer, not per line: the UI polls this file every
+            // 1.5 s, so a second of lag costs nothing and saves a syscall per
+            // line on the path the backend is blocked behind.
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastFlushAt > 1000) {
+                w.flush()
+                lastFlushAt = now
+            }
         } catch (_: Exception) {
             // Diagnostics must never be able to break a generation.
+            logWriter = null
         }
     }
 
@@ -674,7 +706,6 @@ class BackendService : Service() {
     }
 
     private fun rememberLogLine(line: String) {
-        if (isQnnNoise(line)) return
         synchronized(recentLog) {
             recentLog.addLast(line)
             while (recentLog.size > LOG_TAIL_LINES) recentLog.removeFirst()
@@ -688,8 +719,14 @@ class BackendService : Service() {
                 proc.inputStream.bufferedReader().use { reader ->
                     var line: String?
                     while (reader.readLine().also { line = it } != null) {
-                        Log.i(TAG, "Backend: $line")
-                        line?.let { rememberLogLine(it) }
+                        val l = line ?: continue
+                        // Draining is on the critical path: whatever this loop
+                        // does per line, the backend waits for. Noise is
+                        // dropped before any logcat write or file I/O, so the
+                        // expensive work happens only for lines worth keeping.
+                        if (isQnnNoise(l)) continue
+                        Log.i(TAG, "Backend: $l")
+                        rememberLogLine(l)
                     }
                 }
                 proc.waitFor()

@@ -55,6 +55,12 @@
 //
 // Ultrafix is not supported (tiling a 6B DiT is hopeless); img2img and inpaint
 // work whenever vae_encoder.bin is present.
+// Breadcrumbs in this file log at ERROR on purpose. The backend now runs with
+// the QNN log level at "error", because at INFO the DSP layer emits thousands
+// of lines per context into a pipe the app has to drain -- and a pipe nobody
+// drains fast enough blocks the WRITER, which is the backend, mid-load, alive,
+// making no progress and reporting nothing. These lines are progress rather
+// than failures, but they have to outrank the flood to survive it.
 class PipelineZImage : public PipelineQnn {
  public:
   PipelineZImage(TextEncoder &text_encoder, const std::string &model_dir,
@@ -516,7 +522,7 @@ class PipelineZImage : public PipelineQnn {
       // resident while the exception unwinds past the rest of the chain.
       if (seqClip()) {
         clip_parts_[i].reset();
-        QNN_INFO("[clip-seq] part %zu released", i + 1);
+        QNN_ERROR("[clip-seq] part %zu released", i + 1);
       }
       if (st != StatusCode::SUCCESS)
         throw std::runtime_error("Z-Image text encoder part " +
@@ -561,8 +567,8 @@ class PipelineZImage : public PipelineQnn {
       // leave a breadcrumb in the log, because this loop is where the device
       // wedged twice (at the 4th context, ~1.9 GB mapped: a per-process DSP
       // mapping ceiling, not swap pressure).
-      QNN_INFO("[clip] context %zu/%zu (co-resident)", i + 1,
-               clip_part_paths_.size());
+      QNN_ERROR("[clip] context %zu/%zu (co-resident)", i + 1,
+                clip_part_paths_.size());
       reportSub("Loading text encoder", (int)i, (int)clip_part_paths_.size());
       clip_parts_[i] =
           qnn_runtime::createModel(clip_part_paths_[i], clipTag(i).c_str());
@@ -682,14 +688,14 @@ class PipelineZImage : public PipelineQnn {
     // Breadcrumbs on both sides: if the process dies or wedges in here, the
     // error tail's last line names the exact context and phase instead of
     // whatever QNN happened to print last.
-    QNN_INFO("[clip-seq] part %zu/%zu: creating context", i + 1,
-             clip_part_paths_.size());
+    QNN_ERROR("[clip-seq] part %zu/%zu: creating context", i + 1,
+              clip_part_paths_.size());
     clip_parts_[i] =
         qnn_runtime::createAndInitModel(clip_part_paths_[i], clipTag(i).c_str());
     if (!clip_parts_[i])
       throw std::runtime_error("[seq] Failed to load Z-Image text encoder part " +
                                std::to_string(i + 1));
-    QNN_INFO("[clip-seq] part %zu ready", i + 1);
+    QNN_ERROR("[clip-seq] part %zu ready", i + 1);
   }
   void loadCapPartAlone() {
     if (cap_part_) return;
