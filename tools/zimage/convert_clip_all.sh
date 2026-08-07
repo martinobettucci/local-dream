@@ -24,7 +24,16 @@ free_gb() { df -BG --output=avail "$W" | tail -1 | tr -dc '0-9'; }
 echo "==> text encoder: $NPARTS parts, w${WBITS}a16, Hexagon $ARCH -> $HF_REPO/$REMOTE_DIR"
 "$PY" "$HERE/export_clip.py" --work "$W" --parts "$NPARTS" --plan-only
 
-DONE="$("$PY" "$HERE/upload_hf.py" --repo "$HF_REPO" --list-remote "$REMOTE_DIR/" 2>/dev/null || true)"
+# One listing for the whole run rather than one per part: this is the resume
+# point, and re-asking after every upload would only ever confirm what we just
+# did.
+#
+# NOT `|| true`, and not `2>/dev/null`. This listing decides what gets rebuilt,
+# so one that fails and reads as "nothing is published" costs the whole run --
+# which is what happened: a transient Hub error put all 30 already-published
+# parts back in the queue, silently. upload_hf.py now retries and exits non-zero
+# rather than printing nothing, and `set -e` stops here instead of starting over.
+DONE="$("$PY" "$HERE/upload_hf.py" --repo "$HF_REPO" --list-remote "$REMOTE_DIR/")"
 
 # token_emb.bin first: it is a plain fp16 dump with no conversion, it is the
 # single biggest file in the model at 778 MB, and getting it out of the way

@@ -76,13 +76,38 @@ def main():
     api = HfApi()
 
     if args.list_remote is not None:
-        try:
-            for f in api.list_repo_files(args.repo, repo_type="model"):
+        # This listing IS the resume point: convert_all.sh rebuilds whatever it
+        # does not name. So a failure must never look like an empty repo -- and
+        # it did. One transient Hub error was swallowed here, the caller read
+        # "already on the Hub: 0 graphs", and a run with every part already
+        # published started rebuilding all of them from scratch. Nothing in the
+        # log said anything was wrong.
+        #
+        # Retry, then fail loudly. Only a repo that genuinely does not exist yet
+        # is legitimately an empty listing.
+        import time
+
+        from huggingface_hub.errors import RepositoryNotFoundError
+
+        last = None
+        for attempt in range(5):
+            try:
+                files = list(api.list_repo_files(args.repo, repo_type="model"))
+            except RepositoryNotFoundError:
+                return                          # nothing published yet
+            except Exception as exc:  # noqa: BLE001 - reported below
+                last = exc
+                if attempt + 1 < 5:
+                    time.sleep(2 ** attempt * 5)
+                continue
+            for f in files:
                 if f.startswith(args.list_remote):
                     print(f)
-        except Exception:                      # repo does not exist yet
-            pass
-        return
+            return
+        raise SystemExit(
+            f"could not list {args.repo} after 5 tries: {type(last).__name__}: "
+            f"{last}\nRefusing to report an empty listing -- the caller would "
+            f"read it as 'nothing is published' and rebuild everything.")
 
     if args.put:
         remote = args.remote or os.path.basename(args.put)
