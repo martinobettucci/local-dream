@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -828,6 +829,15 @@ int main(int argc, char **argv) {
   // "exited with code 139" and nothing more. The backend is its own process,
   // so there is no crash dialog, and the tombstone is unreadable without root.
   crash_handler::install();
+  // Line-buffer stdout. It is a pipe here, so stdio block-buffers it by
+  // default, and everything logged since the last 4 KB boundary dies with the
+  // process. That is precisely the output worth having: a whole round of
+  // diagnosis produced "no breadcrumbs at all" from a run that had in fact
+  // logged them and lost them in the buffer -- the only lines that survived
+  // were std::endl (which flushes) and the crash handler (which uses write(2)
+  // directly). One flush per line on a log this quiet costs nothing.
+  setvbuf(stdout, nullptr, _IOLBF, 0);
+  setvbuf(stderr, nullptr, _IOLBF, 0);
   if (!qnn::log::initializeLogging()) {
     std::cerr << "ERROR: Init logging failed!\n";
     return EXIT_FAILURE;

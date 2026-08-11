@@ -688,6 +688,105 @@ class QnnModel : public QnnSampleApp {
     return nullptr;
   }
 
+  // Float <-> graph tensor, honouring the tensor's OWN datatype.
+  //
+  // These used to be a memcpy, on the assumption -- written down for Anima and
+  // inherited by Z-Image -- that --preserve_io_datatype leaves every IO tensor
+  // fp32. It does not. That flag is on qairt-converter; qairt-quantizer then
+  // quantizes the IO anyway, and every graph in the Z-Image model has
+  // UFIXED_POINT_16 inputs and outputs. Measured on the published binaries:
+  //
+  //   clip_part1  input_embedding  UFIXED_POINT_16  [1, 512, 2560]
+  //   unet_cap    context          UFIXED_POINT_16  [1, 512, 2560]
+  //               pos_ids          INT_32           [1, 4608, 3]
+  //
+  // So a memcpy of 512*2560 floats wrote 5.24 MB into a 2.62 MB buffer: a 2x
+  // heap overrun on the very first tensor of the very first graph, which is
+  // the SIGSEGV that made this model fail on every attempt in every residency
+  // combination. Had it not crashed it would have fed the encoder noise.
+  //
+  // The element-count guard below did not catch it because it compared
+  // ELEMENTS. It now compares bytes as well, so a datatype the conversion
+  // changes under us can never again be a silent overrun.
+  static size_t dtypeBytes(Qnn_DataType_t dt) {
+    switch (dt) {
+      case QNN_DATATYPE_FLOAT_32:
+      case QNN_DATATYPE_INT_32:
+      case QNN_DATATYPE_UINT_32: return 4;
+      case QNN_DATATYPE_FLOAT_16:
+      case QNN_DATATYPE_UFIXED_POINT_16:
+      case QNN_DATATYPE_SFIXED_POINT_16:
+      case QNN_DATATYPE_INT_16:
+      case QNN_DATATYPE_UINT_16: return 2;
+      case QNN_DATATYPE_UFIXED_POINT_8:
+      case QNN_DATATYPE_SFIXED_POINT_8:
+      case QNN_DATATYPE_INT_8:
+      case QNN_DATATYPE_UINT_8: return 1;
+      default: return 0;
+    }
+  }
+
+  // Quantization parameters, or a scale of 0 when the tensor carries none.
+  static void scaleOffset(const Qnn_Tensor_t &t, float *scale, int32_t *off) {
+    *scale = t.v1.quantizeParams.scaleOffsetEncoding.scale;
+    *off = t.v1.quantizeParams.scaleOffsetEncoding.offset;
+  }
+
+  bool floatToTensor(Qnn_Tensor_t &t, const char *name, const float *src,
+                     size_t elems) {
+    void *dst = QNN_TENSOR_GET_CLIENT_BUF(t).data;
+    const Qnn_DataType_t dt = QNN_TENSOR_GET_DATA_TYPE(t);
+    float scale;
+    int32_t off;
+    scaleOffset(t, &scale, &off);
+    float *in = const_cast<float *>(src);
+    using namespace qnn::tools;
+    switch (dt) {
+      case QNN_DATATYPE_FLOAT_32:
+        memcpy(dst, src, elems * sizeof(float));
+        return true;
+      case QNN_DATATYPE_UFIXED_POINT_16:
+        return datautil::StatusCode::SUCCESS ==
+               datautil::floatToTfN<uint16_t>((uint16_t *)dst, in, off, scale,
+                                              elems);
+      case QNN_DATATYPE_UFIXED_POINT_8:
+        return datautil::StatusCode::SUCCESS ==
+               datautil::floatToTfN<uint8_t>((uint8_t *)dst, in, off, scale,
+                                             elems);
+      default:
+        QNN_ERROR("tensor '%s': cannot write floats into datatype %d", name,
+                  (int)dt);
+        return false;
+    }
+  }
+
+  bool tensorToFloat(Qnn_Tensor_t &t, const char *name, float *dst,
+                     size_t elems) {
+    void *src = QNN_TENSOR_GET_CLIENT_BUF(t).data;
+    const Qnn_DataType_t dt = QNN_TENSOR_GET_DATA_TYPE(t);
+    float scale;
+    int32_t off;
+    scaleOffset(t, &scale, &off);
+    using namespace qnn::tools;
+    switch (dt) {
+      case QNN_DATATYPE_FLOAT_32:
+        memcpy(dst, src, elems * sizeof(float));
+        return true;
+      case QNN_DATATYPE_UFIXED_POINT_16:
+        return datautil::StatusCode::SUCCESS ==
+               datautil::tfNToFloat<uint16_t>(dst, (uint16_t *)src, off, scale,
+                                              elems);
+      case QNN_DATATYPE_UFIXED_POINT_8:
+        return datautil::StatusCode::SUCCESS ==
+               datautil::tfNToFloat<uint8_t>(dst, (uint8_t *)src, off, scale,
+                                             elems);
+      default:
+        QNN_ERROR("tensor '%s': cannot read floats from datatype %d", name,
+                  (int)dt);
+        return false;
+    }
+  }
+
   bool writeNamedFloat(const qnn_wrapper_api::GraphInfo_t &graphInfo,
                        const char *name, const float *src, size_t elems) {
     Qnn_Tensor_t *t = findTensor(inputs, graphInfo.numInputTensors, name);
@@ -705,8 +804,29 @@ class QnnModel : public QnnSampleApp {
                 capacity, elems);
       return false;
     }
-    memcpy(QNN_TENSOR_GET_CLIENT_BUF(*t).data, src, elems * sizeof(float));
-    return true;
+    if (dtypeBytes(QNN_TENSOR_GET_DATA_TYPE(*t)) == 0) {
+      QNN_ERROR("input tensor '%s' has unhandled datatype %d", name,
+                (int)QNN_TENSOR_GET_DATA_TYPE(*t));
+      return false;
+    }
+    return floatToTensor(*t, name, src, elems);
+  }
+
+  // Reads a named output into floats. Same conversion, opposite direction.
+  bool readNamedFloat(const qnn_wrapper_api::GraphInfo_t &graphInfo,
+                      const char *name, float *dst, size_t elems) {
+    Qnn_Tensor_t *t = findTensor(outputs, graphInfo.numOutputTensors, name);
+    if (!t) {
+      QNN_ERROR("missing output tensor '%s'", name);
+      return false;
+    }
+    const size_t capacity = tensorElems(*t);
+    if (elems != capacity) {
+      QNN_ERROR("output tensor '%s' has %zu elements, caller expects %zu", name,
+                capacity, elems);
+      return false;
+    }
+    return tensorToFloat(*t, name, dst, elems);
   }
 
   bool runGraph(const qnn_wrapper_api::GraphInfo_t &graphInfo,
@@ -991,9 +1111,9 @@ class QnnModel : public QnnSampleApp {
       }
       const size_t latent_elems =
           (size_t)zimage_latent_channels * sample_width * sample_height;
-      memcpy(out_sample, QNN_TENSOR_GET_CLIENT_BUF(*term).data,
-             latent_elems * sizeof(float));
-      return StatusCode::SUCCESS;
+      return tensorToFloat(*term, kZImageOutName, out_sample, latent_elems)
+                 ? StatusCode::SUCCESS
+                 : StatusCode::FAILURE;
     }
 
     state.resize(2);
@@ -1006,8 +1126,8 @@ class QnnModel : public QnnSampleApp {
       if (!t) continue;
       size_t n = tensorElems(*t);
       state[k].resize(n);
-      memcpy(state[k].data(), QNN_TENSOR_GET_CLIENT_BUF(*t).data,
-             n * sizeof(float));
+      if (!tensorToFloat(*t, kZImageStateOutNames[k], state[k].data(), n))
+        return StatusCode::FAILURE;
       if (k == 0) saw_hidden = true;
     }
     if (!saw_hidden) {
@@ -1062,6 +1182,15 @@ class QnnModel : public QnnSampleApp {
                 want);
       return false;
     }
+    // The one Z-Image tensor that really is 32-bit: RoPE coordinates are
+    // indices, so the converter leaves them INT_32 while quantizing every float
+    // tensor to UFIXED_POINT_16. Checked rather than assumed -- an unchecked
+    // assumption about exactly this is what made the model crash on every run.
+    if (QNN_TENSOR_GET_DATA_TYPE(*pi) != QNN_DATATYPE_INT_32) {
+      QNN_ERROR("zimage dit: 'pos_ids' is datatype %d, expected INT_32",
+                (int)QNN_TENSOR_GET_DATA_TYPE(*pi));
+      return false;
+    }
     memcpy(QNN_TENSOR_GET_CLIENT_BUF(*pi).data, pos_ids,
            want * sizeof(int32_t));
 
@@ -1108,8 +1237,8 @@ class QnnModel : public QnnSampleApp {
     }
     const size_t n = tensorElems(*t);
     cap.resize(n);
-    memcpy(cap.data(), QNN_TENSOR_GET_CLIENT_BUF(*t).data, n * sizeof(float));
-    return StatusCode::SUCCESS;
+    return tensorToFloat(*t, "cap", cap.data(), n) ? StatusCode::SUCCESS
+                                                   : StatusCode::FAILURE;
   }
 
   // part 1: (sample, timestep, pos_ids [, cap] [, attn_mask]) -> (hidden, emb),
@@ -1173,16 +1302,15 @@ class QnnModel : public QnnSampleApp {
 
     const size_t latent_elems =
         (size_t)zimage_latent_channels * sample_width * sample_height;
-    memcpy(static_cast<float *>(QNN_TENSOR_GET_CLIENT_BUF(inputs[0]).data),
-           latents, latent_elems * sizeof(float));
+    if (!floatToTensor(inputs[0], "latents", latents, latent_elems))
+      return StatusCode::FAILURE;
 
     if (!runGraph(graphInfo, "zimage vae decoder")) return StatusCode::FAILURE;
 
     const size_t pixel_elems = (size_t)3 * output_width * output_height;
-    memcpy(pixel_values,
-           static_cast<float *>(QNN_TENSOR_GET_CLIENT_BUF(outputs[0]).data),
-           pixel_elems * sizeof(float));
-    return StatusCode::SUCCESS;
+    return tensorToFloat(outputs[0], "pixel_values", pixel_values, pixel_elems)
+               ? StatusCode::SUCCESS
+               : StatusCode::FAILURE;
   }
 
   // 3-ch pixels (-1..1) -> 16-ch latent distribution (mean, std).
@@ -1193,20 +1321,17 @@ class QnnModel : public QnnSampleApp {
     logGraphIoOnce("zimage", "vae_encoder", graphInfo);
 
     const size_t pixel_elems = (size_t)3 * output_width * output_height;
-    memcpy(static_cast<float *>(QNN_TENSOR_GET_CLIENT_BUF(inputs[0]).data),
-           pixel_values, pixel_elems * sizeof(float));
+    if (!floatToTensor(inputs[0], "pixel_values", pixel_values, pixel_elems))
+      return StatusCode::FAILURE;
 
     if (!runGraph(graphInfo, "zimage vae encoder")) return StatusCode::FAILURE;
 
     const size_t latent_elems =
         (size_t)zimage_latent_channels * sample_width * sample_height;
-    memcpy(mean,
-           static_cast<float *>(QNN_TENSOR_GET_CLIENT_BUF(outputs[0]).data),
-           latent_elems * sizeof(float));
-    memcpy(std_dev,
-           static_cast<float *>(QNN_TENSOR_GET_CLIENT_BUF(outputs[1]).data),
-           latent_elems * sizeof(float));
-    return StatusCode::SUCCESS;
+    return (tensorToFloat(outputs[0], "mean", mean, latent_elems) &&
+            tensorToFloat(outputs[1], "std", std_dev, latent_elems))
+               ? StatusCode::SUCCESS
+               : StatusCode::FAILURE;
   }
 
   // Qwen3-4B text encoder. Inputs: input_embedding [1,512,2560] fp32 (the
@@ -1296,8 +1421,7 @@ class QnnModel : public QnnSampleApp {
                 tensorElems(*to), elems);
       return false;
     }
-    memcpy(dst, QNN_TENSOR_GET_CLIENT_BUF(*to).data, elems * sizeof(float));
-    return true;
+    return tensorToFloat(*to, "context/hidden", dst, elems);
   }
 
   StatusCode executeUpscalerGraphs(float *input_image, float *output_image) {
