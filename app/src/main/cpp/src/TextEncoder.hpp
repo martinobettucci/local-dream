@@ -426,13 +426,28 @@ class TextEncoder {
     }
     append(suffix, 1.0f);
 
+    // The table is 151936 x 2560 fp16, memory-mapped and indexed without any
+    // checking of its own, so a token id past its last row is a read into
+    // unmapped memory. Checked here rather than trusted: the id comes from
+    // tokenizer.json, which is a file in the model directory and therefore not
+    // ours to assume anything about -- a tokenizer paired with a table built
+    // from a different vocabulary is a silent SIGSEGV on the first prompt.
+    const size_t rows = token_emb_.size() / (size_t)dim;
+    if (rows == 0)
+      throw std::runtime_error("zimage: token_emb.bin is empty or unreadable");
+
     std::vector<float> embeddings((size_t)seq * dim, 0.0f);
     std::vector<int> padded_ids(seq, kQwenPadId);
     std::vector<float> mask(seq, 0.0f);
     for (int pos = 0; pos < seq; ++pos) {
       const bool real = pos < (int)ids.size();
-      const int id = real ? ids[pos] : kQwenPadId;
+      int id = real ? ids[pos] : kQwenPadId;
       const float w = real ? weights[pos] : 1.0f;
+      if (id < 0 || (size_t)id >= rows) {
+        QNN_ERROR("zimage: token id %d is outside the %zu-row embedding table; "
+                  "substituting the pad token", id, rows);
+        id = kQwenPadId;
+      }
       padded_ids[pos] = id;
       mask[pos] = real ? 1.0f : 0.0f;
       const size_t base = (size_t)id * dim;

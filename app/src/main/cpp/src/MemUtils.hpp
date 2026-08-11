@@ -26,17 +26,24 @@ class TokenEmbTable {
 
   bool empty() const { return data_ == nullptr; }
   uint16_t operator[](size_t i) const { return data_[i]; }
+  // Element count, so callers can bounds-check a token id. operator[] indexes
+  // an mmap with no checking of its own: a row past the end of the table is a
+  // read into unmapped memory, i.e. a SIGSEGV with no message, in the one
+  // place where the index comes from a tokenizer rather than from us.
+  size_t size() const { return count_; }
 
   void setOwned(std::vector<uint16_t> &&v) {
     reset();
     owned_ = std::move(v);
     data_ = owned_.data();
+    count_ = owned_.size();
   }
   void setMapped(void *base, size_t bytes) {
     reset();
     map_ = base;
     mapBytes_ = bytes;
     data_ = static_cast<const uint16_t *>(base);
+    count_ = bytes / sizeof(uint16_t);
   }
 
  private:
@@ -48,8 +55,10 @@ class TokenEmbTable {
     }
     owned_ = std::vector<uint16_t>();
     data_ = nullptr;
+    count_ = 0;
   }
   const uint16_t *data_ = nullptr;
+  size_t count_ = 0;
   std::vector<uint16_t> owned_;
   void *map_ = nullptr;
   size_t mapBytes_ = 0;

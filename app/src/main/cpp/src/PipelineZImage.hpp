@@ -226,6 +226,14 @@ class PipelineZImage : public PipelineQnn {
 
   void encodeText(const ProcessedPromptPair &prompts, bool need_negative,
                   bool need_positive, Conditioning &cond) override {
+    // Brackets the prompt-side work that happens before any context is
+    // created -- tokenizing, the fp16 token-embedding lookup, the prompt cache.
+    // Without this the first Z-Image line in the log is the first context
+    // creation, so everything from "Req Rcvd" to here is one unlit stretch,
+    // and a crash inside it is indistinguishable from a crash at load.
+    QNN_ERROR("[zimage] prompts ready (neg=%d pos=%d, seq_clip=%d); "
+              "encoding text",
+              need_negative ? 1 : 0, need_positive ? 1 : 0, seqClip() ? 1 : 0);
     if (lowram_ && !seqClip()) loadClipIfNeeded();
     if (!seqClip() && (clip_parts_.empty() || !clip_parts_.front()))
       throw std::runtime_error("Z-Image text encoder not initialized!");

@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "Config.hpp"
+#include "CrashHandler.hpp"
 #include "MnnUtils.hpp"
 #include "Pipeline.hpp"
 #include "PipelineAnima.hpp"
@@ -823,6 +824,10 @@ static void registerTokenizeEndpoint(httplib::Server &svr,
 }
 
 int main(int argc, char **argv) {
+  // Before anything else: a fatal signal here otherwise reaches the user as
+  // "exited with code 139" and nothing more. The backend is its own process,
+  // so there is no crash dialog, and the tombstone is unreadable without root.
+  crash_handler::install();
   if (!qnn::log::initializeLogging()) {
     std::cerr << "ERROR: Init logging failed!\n";
     return EXIT_FAILURE;
