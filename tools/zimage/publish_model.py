@@ -47,6 +47,12 @@ def collect(files, prefix, stem, expected, label):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default=DEFAULT_REPO)
+    ap.add_argument("--dit-dir", default=None,
+                    help="the DiT directory to publish from, e.g. "
+                         "partial/n32-attn5. Required once more than one "
+                         "exists: two builds of the same split differ only in "
+                         "how much device memory they ask for, which is "
+                         "exactly the kind of difference a guess would hide.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -67,17 +73,24 @@ def main():
                        if f.startswith("partial/n") and f.count("/") >= 2})
     clip_dirs = sorted({f.split("/")[1] for f in names
                         if f.startswith("partial/clip_m") and f.count("/") >= 2})
-    if not dit_dirs:
+    if args.dit_dir:
+        dit_dirs = [args.dit_dir.strip("/").split("/")[-1]]
+        if not any(f.startswith(f"partial/{dit_dirs[0]}/") for f in names):
+            raise SystemExit(f"no files under partial/{dit_dirs[0]}/")
+    elif not dit_dirs:
         raise SystemExit("no partial/n<N>/ directory in the repo yet")
-    if len(dit_dirs) > 1:
-        raise SystemExit(f"several DiT splits present ({dit_dirs}); "
-                         "delete the stale one before publishing")
+    elif len(dit_dirs) > 1:
+        raise SystemExit(f"several DiT builds present ({dit_dirs}); "
+                         "pass --dit-dir to say which one to publish")
     if len(clip_dirs) > 1:
         raise SystemExit(f"several encoder splits present ({clip_dirs})")
 
     dit_prefix = f"partial/{dit_dirs[0]}"
-    dit_parts = collect(names, dit_prefix, "unet_part",
-                        int(dit_dirs[0][1:]), "DiT")
+    import re as _re
+    m = _re.match(r"n(\d+)", dit_dirs[0])
+    if not m:
+        raise SystemExit(f"cannot read a part count from {dit_dirs[0]!r}")
+    dit_parts = collect(names, dit_prefix, "unet_part", int(m.group(1)), "DiT")
     # The caption branch is a graph of its own, not a numbered part, and the
     # backend fails without it -- so it is checked here rather than assumed.
     cap = f"{dit_prefix}/unet_cap.bin"
