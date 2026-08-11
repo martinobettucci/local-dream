@@ -85,11 +85,12 @@ say "work=$W  repo=$HF_REPO  remote=$REMOTE_DIR  arch=$ARCH  w${WBITS}a16"
 #    in a README is what makes "start it again" a complete instruction.
 # ---------------------------------------------------------------------------
 export QNN_SDK_ROOT="${QNN_SDK_ROOT:-/data/qairt/2.39.0.250926}"
-PY="${PY:-/data/zenv/exportvenv/bin/python}"
-QNN="${QNN:-/data/zenv/qnnvenv/bin/python}"
+ZENV="${ZENV:-/data/zenv}"
+PY="${PY:-$ZENV/exportvenv/bin/python}"
+QNN="${QNN:-$ZENV/qnnvenv/bin/python}"
 if [ ! -x "$PY" ] || [ ! -x "$QNN" ] || [ ! -d "$QNN_SDK_ROOT" ]; then
   say "toolchain missing, bootstrapping (SDK + both venvs, ~20 min)"
-  WORK="$W/.envtmp" bash "$HERE/setup_qnn_env.sh" || { say "bootstrap FAILED"; exit 1; }
+  WORK="${ZENV:-/data/zenv}" bash "$HERE/setup_qnn_env.sh" || { say "bootstrap FAILED"; exit 1; }
 fi
 for t in "$PY" "$QNN"; do
   [ -x "$t" ] || { say "still no interpreter at $t"; exit 1; }
