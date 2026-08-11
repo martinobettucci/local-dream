@@ -69,13 +69,24 @@ inline void onFatal(int sig, siginfo_t *info, void *) {
   // print everything rather than guess at the trampoline depth.
   for (int i = 0; i < f.count; ++i) {
     Dl_info dli;
-    if (dladdr(f.pc[i], &dli) && dli.dli_sname) {
-      const char *base = dli.dli_fname ? strrchr(dli.dli_fname, '/') : nullptr;
-      snprintf(line, sizeof(line), "  #%02d %p  %s  (%s+0x%tx)\n", i, f.pc[i],
-               base ? base + 1 : "?", dli.dli_sname,
+    // The module-relative offset is printed whether or not a name resolves.
+    // Address-space layout is randomised, so the absolute pc means nothing off
+    // the device; pc - dli_fbase is a file offset, and that is what the
+    // unstripped artifact under build/android/bin/ can be symbolised against
+    // when a frame is inlined too deeply for dladdr to name it.
+    const bool known = dladdr(f.pc[i], &dli) != 0;
+    const char *fname = known && dli.dli_fname ? dli.dli_fname : nullptr;
+    const char *base = fname ? strrchr(fname, '/') : nullptr;
+    const char *mod = base ? base + 1 : (fname ? fname : "?");
+    if (known && dli.dli_sname) {
+      snprintf(line, sizeof(line), "  #%02d %s+0x%tx  %s+0x%tx\n", i, mod,
+               (char *)f.pc[i] - (char *)dli.dli_fbase, dli.dli_sname,
                (char *)f.pc[i] - (char *)dli.dli_saddr);
+    } else if (known) {
+      snprintf(line, sizeof(line), "  #%02d %s+0x%tx\n", i, mod,
+               (char *)f.pc[i] - (char *)dli.dli_fbase);
     } else {
-      snprintf(line, sizeof(line), "  #%02d %p\n", i, f.pc[i]);
+      snprintf(line, sizeof(line), "  #%02d %p (no module)\n", i, f.pc[i]);
     }
     emit(line);
   }

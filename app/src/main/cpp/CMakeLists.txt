@@ -176,9 +176,25 @@ endif()
 
 # executable
 add_executable(${PROJECT_NAME} ${SOURCES})
-if(NOT QNN_DEBUG_ENABLE)
-    target_link_options(${PROJECT_NAME} PRIVATE "-Wl,-s")
-endif()
+# Keep a symbol table, so a crash can be read rather than guessed at.
+#
+# This used to link with -Wl,-s. That discards .symtab, and an executable
+# exports nothing by default, so .dynsym held imports only -- zero defined
+# symbols in the whole binary. CrashHandler's backtrace then resolved to a
+# column of bare hex addresses, and nothing could symbolise them afterwards
+# either, because no copy of the binary kept any symbols at all.
+#
+# Two changes, both needed:
+#   --export-dynamic  puts global symbols in .dynsym, which dladdr reads at run
+#                     time, so frames name themselves on the device.
+#   no -Wl,-s         keeps .symtab in the linked artifact under
+#                     build/android/bin/, which is what the module-relative
+#                     offsets in a crash report get symbolised against when a
+#                     frame is inlined too deeply for dladdr.
+#
+# The APK copy is stripped by AGP's own packaging step, so the shipped size is
+# unchanged; the offsets stay identical because it is the same link.
+target_link_options(${PROJECT_NAME} PRIVATE "-Wl,--export-dynamic")
 target_include_directories(${PROJECT_NAME} PRIVATE ${PACKAGE_INCLUDES})
 
 set_target_properties(${PROJECT_NAME}
