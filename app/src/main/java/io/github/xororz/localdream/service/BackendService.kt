@@ -56,18 +56,46 @@ class BackendService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + backendDispatcher)
 
     companion object {
-        private const val LOG_TAIL_LINES = 400
+        // The whole journal is shown now, so it is sized for a failure rather
+        // than for a glance. One CDSP subsystem restart emits dozens of
+        // identical transport errors; at 400 lines that flood evicted every
+        // line that said what the run was doing before it.
+        private const val LOG_TAIL_LINES = 5000
         private const val LOG_FILE = "backend_last.log"
-        private const val LOG_FILE_MAX_BYTES = 256L * 1024
+        private const val LOG_FILE_MAX_BYTES = 4L * 1024 * 1024
 
-        /** The persisted tail, which survives the app being killed. Falls back
-         * to the in-memory ring when the file is missing. */
-        fun persistedLog(context: Context, maxLines: Int = 120): String = try {
+        /** The persisted journal, which survives the app being killed. Falls
+         * back to the in-memory ring when the file is missing.
+         *
+         * Not truncated: the panel scrolls, and the line that explains a
+         * failure is regularly hundreds of lines above the last one. */
+        fun persistedLog(context: Context, maxLines: Int = LOG_TAIL_LINES): String = try {
             val f = File(context.filesDir, LOG_FILE)
             if (f.exists()) f.readLines().takeLast(maxLines).joinToString("\n")
             else logTail(maxLines)
         } catch (_: Exception) {
             logTail(maxLines)
+        }
+
+        /** Empties the journal, on disk and in memory. The next backend start
+         * writes into a clean file, so one attempt can be read on its own
+         * instead of being spliced onto every attempt before it. */
+        fun clearLog(context: Context) {
+            synchronized(recentLog) { recentLog.clear() }
+            self?.let { svc ->
+                try {
+                    svc.logWriter?.flush(); svc.logWriter?.close()
+                } catch (_: Exception) {
+                }
+                svc.logWriter = null
+                svc.logBytes = 0
+                svc.lastLine = null
+                svc.repeatCount = 0
+            }
+            try {
+                File(context.filesDir, LOG_FILE).delete()
+            } catch (_: Exception) {
+            }
         }
         private val recentLog = ArrayDeque<String>()
 
@@ -718,6 +746,32 @@ class BackendService : Service() {
         return line.contains("<I>") || line.contains("<V>") || line.contains("<W>")
     }
 
+    // Consecutive identical lines are collapsed rather than repeated. A CDSP
+    // subsystem restart prints the same two transport errors dozens of times;
+    // written out in full they are most of the journal and push out everything
+    // that named what was actually being loaded. Collapsing is lossless -- the
+    // count is kept -- and it is only ever applied to lines that are byte-for-
+    // byte identical and adjacent.
+    private var lastLine: String? = null
+    private var repeatCount = 0
+
+    private fun rememberDeduped(line: String, flush: Boolean) {
+        if (line == lastLine) {
+            repeatCount++
+            return
+        }
+        flushRepeat()
+        lastLine = line
+        rememberLogLine(line, flush)
+    }
+
+    private fun flushRepeat() {
+        if (repeatCount > 0) {
+            rememberLogLine("    ... previous line repeated $repeatCount more time(s)")
+            repeatCount = 0
+        }
+    }
+
     private fun rememberLogLine(line: String, flush: Boolean = true) {
         synchronized(recentLog) {
             recentLog.addLast(line)
@@ -735,6 +789,8 @@ class BackendService : Service() {
      * the process ended; none of it was ever recorded. */
     private fun appLog(line: String) {
         Log.i(TAG, line)
+        flushRepeat()
+        lastLine = null
         rememberLogLine("[app] $line")
     }
 
@@ -790,7 +846,7 @@ class BackendService : Service() {
                         // ready() is true and the lines stay buffered; the
                         // moment the backend goes quiet -- which is when we
                         // most need what it last said -- the line is on disk.
-                        rememberLogLine(l, flush = !reader.ready())
+                        rememberDeduped(l, flush = !reader.ready())
                     }
                 }
                 proc.waitFor()
@@ -802,6 +858,7 @@ class BackendService : Service() {
                 }
                 return@Thread
             }
+            flushRepeat()
             Log.i(TAG, "Backend process exited with code: $exitCode")
             // How a process ended is the one fact that separates "died" from
             // "wedged", and it was only ever in logcat. 137 is SIGKILL, which

@@ -35,6 +35,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -114,12 +115,15 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalResources
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -347,6 +351,7 @@ fun ModelRunScreen(
     // Backend log panel. Polled from the on-disk mirror so it is there whether
     // or not anything failed, and after the app has been killed and reopened.
     var backendLog by remember { mutableStateOf("") }
+    val clipboardManager = LocalClipboardManager.current
     var showBackendLog by remember { mutableStateOf(true) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var isCheckingBackend by remember { mutableStateOf(true) }
@@ -2339,15 +2344,53 @@ fun ModelRunScreen(
                             }
                         }
                         if (showBackendLog) {
-                            SelectionContainer {
-                                Text(
-                                    backendLog.ifEmpty {
-                                        "(no output yet — the backend service " +
-                                            "has not started a process)"
-                                    },
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
+                            // The WHOLE journal, in its own scroll area. It was
+                            // capped at 120 lines before, which is less than one
+                            // CDSP subsystem restart emits -- so the lines that
+                            // said what was being loaded had already scrolled off
+                            // by the time the failure printed. Bounded height so
+                            // the page stays usable; horizontal scroll so long
+                            // QNN lines are not wrapped into soup.
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(max = 320.dp)
+                                    .verticalScroll(rememberScrollState()),
+                            ) {
+                                SelectionContainer {
+                                    Text(
+                                        backendLog.ifEmpty {
+                                            "(no output yet — the backend " +
+                                                "service has not started a " +
+                                                "process)"
+                                        },
+                                        style = MaterialTheme.typography.bodySmall,
+                                        fontFamily = FontFamily.Monospace,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.horizontalScroll(
+                                            rememberScrollState(),
+                                        ),
+                                    )
+                                }
+                            }
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(top = 4.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                // Copying beats selecting by hand: the journal
+                                // is thousands of lines and the useful part is
+                                // never the part that happens to be on screen.
+                                TextButton(onClick = {
+                                    clipboardManager.setText(
+                                        AnnotatedString(backendLog),
+                                    )
+                                }) { Text("Copy all") }
+                                TextButton(onClick = {
+                                    BackendService.clearLog(context)
+                                    backendLog = ""
+                                }) { Text("Clear") }
                             }
                         }
                     }
