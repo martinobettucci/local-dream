@@ -8,6 +8,8 @@ model unexportable. The rotation is identical in real arithmetic:
 freqs_cis carries a trailing dim of 2 holding (cos, sin) instead of complex64;
 every other shape is unchanged.
 """
+import os
+
 import torch
 from diffusers.models.transformers import transformer_z_image as tzi
 
@@ -57,6 +59,11 @@ def _rope_call_real(self, ids: torch.Tensor):
 # exp(-100 - 17) = 4e-51 against the softmax output's own 16-bit resolution of
 # 1.5e-5. That is ~45 decades of margin. Do not "harden" this back toward -inf.
 MASK_NEG = -100.0
+
+# Heads per attention group; see the note in _processor_call. 0 means "all of
+# them", i.e. the original single-shot attention. 5 divides the model's 30
+# heads evenly and puts the live score tensor at 4608^2 x 5 x 2 = 212 MB.
+ATTN_HEAD_CHUNK = int(os.environ.get("ZIMAGE_ATTN_HEAD_CHUNK", "5"))
 
 
 def _apply_rotary_emb_real(x_in: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
@@ -108,16 +115,45 @@ def _processor_call(self, attn, hidden_states, encoder_hidden_states=None,
     # runner's mask always keeps at least the image tokens, which come first.
     # An additive float mask, not a boolean one, for the same reason -- 0 where
     # attending is allowed, MASK_NEG where it is not.
+    # ...and computed in GROUPS OF HEADS, not all thirty at once.
+    #
+    # The score tensor is [1, heads, T, T]. At T = 4608 and 30 heads that is
+    # 4608^2 x 30 x 2 bytes = 1.27 GB live, and the HTP sizes a context to hold
+    # it. Measured on device, by what loaded and what did not:
+    #
+    #   caption branch  T =  512   0.51 GB estimate   loads in 0.8 s
+    #   part 1          T = 4096   1.50 GB estimate   loads in 4.5 s
+    #   part 2          T = 4608   2.17 GB estimate   REFUSED
+    #     "Failed to find available PD for contextId 1 ... with context size
+    #      estimate 2171250944"
+    #
+    # So the ceiling sits between 1.5 and 2.17 GB, and the term that crosses it
+    # is quadratic in sequence length. Nothing about the weights is the problem:
+    # every part is the same 490 MB.
+    #
+    # ATTN_HEAD_CHUNK heads at a time cuts the live score tensor by that factor
+    # while computing exactly the same result -- heads are independent all the
+    # way from the q/k/v projections to the concatenation, so this is a
+    # regrouping of the arithmetic, not an approximation. The cost is more,
+    # smaller MatMuls; at 5 heads each is still 4608x4608x128, far above the
+    # size where per-op overhead matters.
     scale = q.shape[-1] ** -0.5
-    scores = torch.matmul(q, k.transpose(-2, -1)) * scale
-    if attention_mask is not None:
-        if attention_mask.dtype == torch.bool:
-            attention_mask = torch.where(
-                attention_mask,
-                torch.zeros((), dtype=scores.dtype),
-                torch.full((), MASK_NEG, dtype=scores.dtype))
-        scores = scores + attention_mask.to(scores.dtype)
-    hs = torch.matmul(torch.softmax(scores, dim=-1), v)
+    if attention_mask is not None and attention_mask.dtype == torch.bool:
+        attention_mask = torch.where(
+            attention_mask,
+            torch.zeros((), dtype=q.dtype),
+            torch.full((), MASK_NEG, dtype=q.dtype))
+
+    n_heads = q.shape[1]
+    chunk = ATTN_HEAD_CHUNK if ATTN_HEAD_CHUNK > 0 else n_heads
+    parts = []
+    for h0 in range(0, n_heads, chunk):
+        h1 = min(h0 + chunk, n_heads)
+        scores = torch.matmul(q[:, h0:h1], k[:, h0:h1].transpose(-2, -1)) * scale
+        if attention_mask is not None:
+            scores = scores + attention_mask.to(scores.dtype)
+        parts.append(torch.matmul(torch.softmax(scores, dim=-1), v[:, h0:h1]))
+    hs = parts[0] if len(parts) == 1 else torch.cat(parts, dim=1)
     hs = hs.transpose(1, 2).flatten(2).type_as(query)
     return attn.to_out[0](hs)
 
