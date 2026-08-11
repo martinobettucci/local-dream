@@ -4,7 +4,6 @@ import android.app.*
 import android.content.Context
 import android.content.Intent
 import android.os.IBinder
-import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import io.github.xororz.localdream.BuildConfig
@@ -621,10 +620,15 @@ class BackendService : Service() {
                 env["LOCALDREAM_ZIMAGE_SEQ_CLIP"] = "1"
             }
 
-            Log.d(TAG, "COMMAND: ${command.joinToString(" ")}")
             Log.d(TAG, "DIR: $runtimeDir")
             Log.d(TAG, "LD_LIBRARY_PATH=${env["LD_LIBRARY_PATH"]}")
             Log.d(TAG, "DSP_LIBRARY_PATH=${env["DSP_LIBRARY_PATH"]}")
+
+            // Recorded BEFORE the exec, so the log describes the attempt even
+            // if the process never gets far enough to describe itself.
+            appLog("=== start ${config.backendType} ${config.modelId} ===")
+            appLog("cmd: ${command.joinToString(" ")}")
+            describeModelDir(command)
 
             val processBuilder = ProcessBuilder(command).apply {
                 directory(File(nativeDir))
@@ -640,6 +644,7 @@ class BackendService : Service() {
             return true
         } catch (e: Exception) {
             Log.e(TAG, "backend start failed", e)
+            appLog("start failed before exec: ${e.message}")
             updateState(BackendState.Error("backend start failed: ${e.message}", config.modelId))
             return false
         }
@@ -655,35 +660,43 @@ class BackendService : Service() {
     // observe -- so every kept line is appended here and the UI reads the file.
     private var logWriter: java.io.BufferedWriter? = null
     private var logBytes = 0L
-    private var lastFlushAt = 0L
 
-    private fun appendToLogFile(line: String) {
+    private fun openLogWriter(): java.io.BufferedWriter {
+        val f = File(filesDir, LOG_FILE)
+        logBytes = f.length()
+        // APPEND. `File.bufferedWriter()` truncates, which threw away the log
+        // of the run that failed the moment the next backend started -- and a
+        // restart is exactly what follows a failure, so the panel could only
+        // ever show a run that had not gone wrong yet. `logBytes = f.length()`
+        // was already written as if this appended; only the call did not.
+        return java.io.BufferedWriter(
+            java.io.OutputStreamWriter(java.io.FileOutputStream(f, true)),
+            16 * 1024,
+        ).also { logWriter = it }
+    }
+
+    private fun appendToLogFile(line: String, flush: Boolean) {
         try {
-            var w = logWriter
-            if (w == null) {
-                val f = File(filesDir, LOG_FILE)
-                logBytes = f.length()
-                w = f.bufferedWriter(bufferSize = 16 * 1024).also { logWriter = it }
-            }
+            var w = logWriter ?: openLogWriter()
             if (logBytes > LOG_FILE_MAX_BYTES) {
                 // Rotate rarely and cheaply: close, keep the tail, reopen.
                 w.flush(); w.close(); logWriter = null
                 val f = File(filesDir, LOG_FILE)
                 val keep = f.readLines().takeLast(LOG_TAIL_LINES)
                 f.writeText(keep.joinToString("\n") + "\n")
-                logBytes = f.length()
-                w = f.bufferedWriter(bufferSize = 16 * 1024).also { logWriter = it }
+                w = openLogWriter()
             }
             w.write(line); w.newLine()
             logBytes += line.length + 1
-            // Flush on a timer, not per line: the UI polls this file every
-            // 1.5 s, so a second of lag costs nothing and saves a syscall per
-            // line on the path the backend is blocked behind.
-            val now = SystemClock.elapsedRealtime()
-            if (now - lastFlushAt > 1000) {
-                w.flush()
-                lastFlushAt = now
-            }
+            // Flushed when the pipe has gone quiet, not on a timer. A timer
+            // flushes only when the NEXT line arrives, so a backend that
+            // stops printing -- which is the failure being diagnosed --
+            // stranded everything since the last flush in a 16 KB buffer that
+            // nothing would ever drain. Flushing at the moment the reader has
+            // nothing left costs one syscall per burst, keeps the flood path
+            // buffered, and guarantees the last thing said before a stall is
+            // on disk.
+            if (flush) w.flush()
         } catch (_: Exception) {
             // Diagnostics must never be able to break a generation.
             logWriter = null
@@ -705,12 +718,59 @@ class BackendService : Service() {
         return line.contains("<I>") || line.contains("<V>") || line.contains("<W>")
     }
 
-    private fun rememberLogLine(line: String) {
+    private fun rememberLogLine(line: String, flush: Boolean = true) {
         synchronized(recentLog) {
             recentLog.addLast(line)
             while (recentLog.size > LOG_TAIL_LINES) recentLog.removeFirst()
         }
-        appendToLogFile(line)
+        appendToLogFile(line, flush)
+    }
+
+    /** A line the APP knows, written to the same log the backend writes to.
+     *
+     * Until now every line in that log came from the backend's stdout, so a
+     * backend that died at exec or wedged before printing produced a literally
+     * empty panel -- "no log, nothing", with no way to tell the two apart. The
+     * app knows the command it ran, what was in the model directory, and how
+     * the process ended; none of it was ever recorded. */
+    private fun appLog(line: String) {
+        Log.i(TAG, line)
+        rememberLogLine("[app] $line")
+    }
+
+    /** What is actually in the model directory the command points at.
+     *
+     * A Z-Image directory is 45 files and 17.6 GB; one missing or truncated
+     * piece makes the backend exit on a "File not found" it may not live long
+     * enough to print, and a partial download looks identical to a complete
+     * one from the model list. Counting the graphs and naming any short file
+     * turns that into something the log states outright. */
+    private fun describeModelDir(command: List<String>) {
+        try {
+            val i = command.indexOf("--model_dir")
+            if (i < 0 || i + 1 >= command.size) return
+            val dir = File(command[i + 1])
+            val files = dir.listFiles()
+            if (files == null) {
+                appLog("model_dir ${dir.absolutePath}: UNREADABLE OR ABSENT")
+                return
+            }
+            val bins = files.filter { it.name.endsWith(".bin") }
+            val bytes = files.sumOf { it.length() }
+            appLog(
+                "model_dir ${dir.absolutePath}: ${files.size} files, " +
+                    "${bins.size} .bin, %.2f GB".format(bytes / 1e9),
+            )
+            // A context binary is hundreds of MB. Anything tiny is a file the
+            // download left behind, and it will fail at load rather than here.
+            val short = bins.filter { it.length() < 1_000_000L }
+            if (short.isNotEmpty()) {
+                appLog("SHORT FILES (likely an incomplete download): " +
+                    short.joinToString(", ") { "${it.name}=${it.length()}B" })
+            }
+        } catch (e: Exception) {
+            appLog("model_dir inspection failed: ${e.message}")
+        }
     }
 
     private fun startMonitorThread(proc: Process) {
@@ -726,25 +786,42 @@ class BackendService : Service() {
                         // expensive work happens only for lines worth keeping.
                         if (isQnnNoise(l)) continue
                         Log.i(TAG, "Backend: $l")
-                        rememberLogLine(l)
+                        // Flush only when the pipe has drained. During a flood
+                        // ready() is true and the lines stay buffered; the
+                        // moment the backend goes quiet -- which is when we
+                        // most need what it last said -- the line is on disk.
+                        rememberLogLine(l, flush = !reader.ready())
                     }
                 }
                 proc.waitFor()
             } catch (e: Exception) {
                 Log.e(TAG, "monitor error", e)
+                appLog("monitor error: ${e.message}")
                 if (isLiveCrash(proc)) {
                     updateState(BackendState.Error("monitor error: ${e.message}", servingModelId.value))
                 }
                 return@Thread
             }
             Log.i(TAG, "Backend process exited with code: $exitCode")
+            // How a process ended is the one fact that separates "died" from
+            // "wedged", and it was only ever in logcat. 137 is SIGKILL, which
+            // on Android means the low-memory killer took it -- a diagnosis in
+            // one number, and one the user can read off the panel.
+            val why = when (exitCode) {
+                0 -> ""
+                137 -> " (SIGKILL -- the system's low-memory killer, almost always)"
+                139 -> " (SIGSEGV)"
+                134 -> " (SIGABRT)"
+                else -> ""
+            }
+            appLog("backend exited with code $exitCode$why")
             // Only surface as an error when this is still the active process and
             // we didn't intentionally stop it; a torn-down or superseded process
             // exiting is expected and must not poison the shared backendState.
             if (isLiveCrash(proc)) {
                 updateState(
                     BackendState.Error(
-                        "Backend process exited with code: $exitCode",
+                        "Backend process exited with code: $exitCode$why",
                         servingModelId.value,
                     ),
                 )

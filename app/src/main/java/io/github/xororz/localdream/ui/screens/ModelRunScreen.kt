@@ -2309,11 +2309,15 @@ fun ModelRunScreen(
                 }
             }
 
-            // Backend log, never gated on an error firing. Rounds of
-            // diagnosis were lost to failures that produce no error at all:
-            // a wedged process throws nothing and a killed app takes its
-            // in-memory state with it. This reads the on-disk mirror.
-            if (backendLog.isNotEmpty()) {
+            // Backend log, never gated on an error firing, and never hidden
+            // for being empty. Rounds of diagnosis were lost to failures that
+            // produce no error at all: a wedged process throws nothing and a
+            // killed app takes its in-memory state with it. Hiding the card
+            // when the log was empty cost another round -- "no log, nothing"
+            // is indistinguishable from "no panel", and the two have entirely
+            // different causes. The app writes its own lines now, so empty
+            // here means the service never ran at all, which the card says.
+            run {
                 ElevatedCard(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -2337,7 +2341,10 @@ fun ModelRunScreen(
                         if (showBackendLog) {
                             SelectionContainer {
                                 Text(
-                                    backendLog,
+                                    backendLog.ifEmpty {
+                                        "(no output yet — the backend service " +
+                                            "has not started a process)"
+                                    },
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )

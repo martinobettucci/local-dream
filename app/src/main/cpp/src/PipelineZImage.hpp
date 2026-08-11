@@ -610,6 +610,10 @@ class PipelineZImage : public PipelineQnn {
     // binaries, all mapped before the first denoising step can start.
     const int n_load = (int)dit_parts_.size() + 1;      // + the caption branch
     for (size_t i = 0; i < dit_parts_.size(); ++i) {
+      // At ERROR for the same reason the seq paths are: reportSub reaches the
+      // progress bar but never the log, and the log is what survives a kill.
+      QNN_ERROR("[dit] context %zu/%zu (co-resident)", i + 1,
+                dit_parts_.size());
       reportSub("Loading DiT", (int)i, n_load);
       dit_parts_[i] =
           qnn_runtime::createModel(dit_part_paths_[i], partTag(i).c_str());
@@ -659,13 +663,23 @@ class PipelineZImage : public PipelineQnn {
 
   // seq_dit: one part resident at a time, each with its own spill-fill buffer
   // (no group sharing — the parts are never co-resident).
+  //
+  // Breadcrumbs on both sides, at ERROR so they outrank the quieted backend.
+  // This is the busiest and most memory-stressed operation in a generation --
+  // 33 contexts mapped and unmapped per denoising step, 489 MB at a time --
+  // and it was the only load path with nothing to say. A process killed or
+  // wedged in here left a log whose last line was about the text encoder,
+  // several minutes and a hundred context loads earlier.
   void loadDitPartAlone(size_t i) {
     if (dit_parts_[i]) return;
+    QNN_ERROR("[dit-seq] part %zu/%zu: creating context", i + 1,
+              dit_part_paths_.size());
     dit_parts_[i] =
         qnn_runtime::createAndInitModel(dit_part_paths_[i], partTag(i).c_str());
     if (!dit_parts_[i])
       throw std::runtime_error("[seq_dit] Failed to load Z-Image DiT part " +
                                std::to_string(i + 1));
+    QNN_ERROR("[dit-seq] part %zu ready", i + 1);
   }
   void releaseDitPart(size_t i) {
     if (!dit_parts_[i]) return;
@@ -699,10 +713,12 @@ class PipelineZImage : public PipelineQnn {
   }
   void loadCapPartAlone() {
     if (cap_part_) return;
+    QNN_ERROR("[dit-seq] caption branch: creating context");
     cap_part_ = qnn_runtime::createAndInitModel(cap_part_path_, "unet_cap");
     if (!cap_part_)
       throw std::runtime_error(
           "[seq_dit] Failed to load the Z-Image DiT caption branch");
+    QNN_ERROR("[dit-seq] caption branch ready");
   }
 
   void loadVaeEncoderIfNeeded() {
