@@ -158,6 +158,10 @@ data class Model(
             putExtra(ModelDownloadService.EXTRA_MODEL_NAME, name)
             putExtra(ModelDownloadService.EXTRA_FILE_URL, "${baseUrl.removeSuffix("/")}/$fileUri")
             putExtra(ModelDownloadService.EXTRA_IS_ZIP, fileUri.endsWith(".zip"))
+            // Z-Image carries its own version stamp; see ZIMAGE_MARKER.
+            if (id == "zimage_turbo")
+                putExtra(ModelDownloadService.EXTRA_VERSION_MARKER,
+                    ModelDownloadService.ZIMAGE_MARKER)
             putExtra(ModelDownloadService.EXTRA_IS_NPU, !runOnCpu)
             putExtra(ModelDownloadService.EXTRA_MODEL_TYPE, "sd")
         }
@@ -286,14 +290,28 @@ data class Model(
             return file.exists() && file.length() > 0
         }
 
-        fun needsModelUpgrade(context: Context, modelId: String, isNpu: Boolean): Boolean {
+        // The default marker is shared by every NPU model, so bumping it would
+        // make all of them re-download. `marker` lets one model be invalidated
+        // on its own -- which is what a rebuild of that model's weights needs:
+        // an install whose files are stale but complete looks finished to
+        // isModelDownloaded, offers no refresh, and quietly keeps running the
+        // old ones. That is not hypothetical. The Z-Image DiT was rebuilt with
+        // head-chunked attention because the previous graphs asked the device
+        // for a 2.02 GB context and no protection domain is that large; without
+        // a marker of its own, every existing install would have kept the
+        // graphs that cannot load.
+        fun needsModelUpgrade(
+            context: Context,
+            modelId: String,
+            isNpu: Boolean,
+            marker: String = "v3",
+        ): Boolean {
             if (!isNpu) return false
 
             val modelDir = File(getModelsDir(context), modelId)
             if (!modelDir.exists()) return false
 
-            val vFile = File(modelDir, "v3")
-            return !vFile.exists()
+            return !File(modelDir, marker).exists()
         }
     }
 }
@@ -624,7 +642,8 @@ class ModelRepository private constructor(private val context: Context) {
         // meant Z-Image was the one entry with no upgrade path -- a directory
         // written by an older build, missing the "v3" marker, would show as
         // downloaded forever with no way to refresh it short of deleting.
-        val needsUpgrade = Model.needsModelUpgrade(context, id, true)
+        val needsUpgrade = Model.needsModelUpgrade(
+            context, id, true, ModelDownloadService.ZIMAGE_MARKER)
 
         return Model(
             id = id,
@@ -637,7 +656,7 @@ class ModelRepository private constructor(private val context: Context) {
             // The DiT is 12.9 GB across 33 contexts, the Qwen3-4B encoder
             // 3.6 GB across 6, plus a 778 MB fp16 token-embedding table the
             // CPU indexes and 341 MB of VAE.
-            approximateSize = "17.6GB",
+            approximateSize = "17.7GB",
             isDownloaded = isDownloaded,
             needsUpgrade = needsUpgrade,
             // Unlike the other distilled models here, these are set in code

@@ -100,17 +100,37 @@ def main():
 
     plan = [(src, src.rsplit("/", 1)[1]) for src in dit_parts]
 
+    # The text encoder, from partial/ if it is still there and from the last
+    # published model/ if it is not.
+    #
+    # This fallback is not tidiness. partial/clip_m6/ was deleted once the model
+    # was published ("model/ holds the same bytes"), which is true -- but the
+    # next publish then found no encoder, took the "publishing DiT only" branch,
+    # and wrote a manifest of 38 files instead of 45. The bytes were still in
+    # model/; only the list of them was wrong, so a fresh install downloaded a
+    # directory the backend cannot start from. A warning is the wrong severity
+    # for a piece main.cpp calls showHelpAndExit over: it is fatal below.
     if clip_dirs:
         clip_prefix = f"partial/{clip_dirs[0]}"
-        clip_parts = collect(names, clip_prefix, "clip_part",
-                             int(clip_dirs[0].split("_m")[1]), "text encoder")
-        plan += [(src, src.rsplit("/", 1)[1]) for src in clip_parts]
-        tok = f"{clip_prefix}/token_emb.bin"
-        if tok not in names:
-            raise SystemExit(f"{tok} missing")
-        plan.append((tok, "token_emb.bin"))
+        n_clip = int(clip_dirs[0].split("_m")[1])
     else:
-        print("warning: no text encoder parts found; publishing DiT only")
+        clip_prefix = DEST
+        n_clip = 0
+        while f"{DEST}/clip_part{n_clip + 1}.bin" in names:
+            n_clip += 1
+        if n_clip:
+            print(f"note: no partial/clip_m*/; taking the {n_clip}-part encoder "
+                  f"from {DEST}/, which is where it already lives")
+    if not n_clip:
+        raise SystemExit(
+            "no text encoder found under partial/clip_m*/ or "
+            f"{DEST}/clip_part*.bin, and the backend cannot start without it")
+    clip_parts = collect(names, clip_prefix, "clip_part", n_clip, "text encoder")
+    plan += [(src, src.rsplit("/", 1)[1]) for src in clip_parts]
+    tok = f"{clip_prefix}/token_emb.bin"
+    if tok not in names:
+        raise SystemExit(f"{tok} missing, and the backend requires it")
+    plan.append((tok, "token_emb.bin"))
 
     # tokenizer.json, token_emb.bin, clip and the VAE decoder are hard
     # requirements in main.cpp's zimage branch -- the backend calls
@@ -118,17 +138,24 @@ def main():
     # than a warning. config.json and the ZIMAGE marker only matter for a
     # manually imported copy, so they are included when present and skipped
     # otherwise.
+    def find(name):
+        for prefix in ("partial", DEST):
+            if f"{prefix}/{name}" in names:
+                return f"{prefix}/{name}"
+        return None
+
     for extra in ("tokenizer.json", "vae_decoder.bin"):
-        src = f"partial/{extra}"
-        if src not in names:
-            raise SystemExit(f"{src} missing, and the backend requires it")
+        src = find(extra)
+        if src is None:
+            raise SystemExit(f"{extra} is in neither partial/ nor {DEST}/, "
+                             f"and the backend requires it")
         plan.append((src, extra))
     for extra in ("vae_encoder.bin", "config.json", "ZIMAGE"):
-        src = f"partial/{extra}"
-        if src in names:
+        src = find(extra)
+        if src:
             plan.append((src, extra))
         else:
-            print(f"note: {src} absent, skipping (optional)")
+            print(f"note: {extra} absent, skipping (optional)")
 
     total = sum(sizes.get(src) or 0 for src, _ in plan)
     print(f"{len(plan)} files, {total / 1e9:.2f} GB")
@@ -149,10 +176,12 @@ def main():
 
     # Server-side copies: the bytes never pass through this machine.
     ops = [CommitOperationCopy(src_path_in_repo=src, path_in_repo=f"{DEST}/{dst}")
-           for src, dst in plan]
-    api.create_commit(repo_id=args.repo, repo_type="model", operations=ops,
-                      commit_message=f"publish {len(plan)} model files to {DEST}/")
-    print(f"copied {len(ops)} files to {DEST}/")
+           for src, dst in plan if src != f"{DEST}/{dst}"]
+    if ops:
+        api.create_commit(repo_id=args.repo, repo_type="model", operations=ops,
+                          commit_message=f"publish {len(plan)} model files to {DEST}/")
+    print(f"copied {len(ops)} files to {DEST}/ "
+          f"({len(plan) - len(ops)} already in place)")
 
     api.upload_file(
         path_or_fileobj=json.dumps(manifest, indent=2).encode(),

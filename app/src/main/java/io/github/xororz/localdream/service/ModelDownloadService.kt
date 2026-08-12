@@ -58,6 +58,19 @@ class ModelDownloadService : Service() {
         const val EXTRA_MODEL_NAME = "model_name"
         const val EXTRA_FILE_URL = "file_url"
         const val EXTRA_IS_ZIP = "is_zip"
+
+        // Version stamp written into the model directory on a successful NPU
+        // download, and checked by Model.needsModelUpgrade. Defaults to the
+        // shared "v3"; a model whose weights are rebuilt passes its own, so
+        // only that model is invalidated instead of every NPU model at once.
+        const val EXTRA_VERSION_MARKER = "version_marker"
+
+        // Bumped when the Z-Image DiT was rebuilt with head-chunked attention.
+        // The previous graphs ask the device for a 2.02 GB context and no
+        // protection domain is that large, so an install carrying them cannot
+        // generate at all -- and, being complete, would never have refreshed
+        // itself on the shared marker.
+        const val ZIMAGE_MARKER = "zimage_attn5"
         const val EXTRA_IS_NPU = "is_npu"
         const val EXTRA_MODEL_TYPE = "model_type" // "sd" or "upscaler"
 
@@ -92,10 +105,11 @@ class ModelDownloadService : Service() {
                 val fileUrl = intent.getStringExtra(EXTRA_FILE_URL) ?: return START_NOT_STICKY
                 val isZip = intent.getBooleanExtra(EXTRA_IS_ZIP, false)
                 val isNpu = intent.getBooleanExtra(EXTRA_IS_NPU, false)
+                val marker = intent.getStringExtra(EXTRA_VERSION_MARKER) ?: "v3"
                 val modelType = intent.getStringExtra(EXTRA_MODEL_TYPE) ?: "sd"
 
                 startForeground(NOTIFICATION_ID, createNotification(modelName, 0f))
-                startDownload(modelId, modelName, fileUrl, isZip, isNpu, modelType)
+                startDownload(modelId, modelName, fileUrl, isZip, isNpu, marker, modelType)
             }
 
             ACTION_CANCEL_DOWNLOAD -> {
@@ -111,6 +125,7 @@ class ModelDownloadService : Service() {
         fileUrl: String,
         isZip: Boolean,
         isNpu: Boolean,
+        marker: String,
         modelType: String,
     ) {
         downloadJob?.cancel()
@@ -133,7 +148,7 @@ class ModelDownloadService : Service() {
                 // so the device needs twice the model's size free, and a dropped
                 // connection costs the whole archive instead of one file.
                 if (modelType == "sd" && fileUrl.endsWith(MANIFEST_SUFFIX)) {
-                    downloadFromManifest(modelId, modelName, fileUrl, isNpu)
+                    downloadFromManifest(modelId, modelName, fileUrl, isNpu, marker)
                     tempDir.deleteRecursively()
 
                     _downloadState.value = DownloadState.Success(modelId)
@@ -177,6 +192,7 @@ class ModelDownloadService : Service() {
 
                             if (isNpu) {
                                 File(modelDir, "v3").createNewFile()
+                                if (marker != "v3") File(modelDir, marker).createNewFile()
                             }
                         }
                     }
@@ -332,6 +348,7 @@ class ModelDownloadService : Service() {
         modelName: String,
         manifestUrl: String,
         isNpu: Boolean,
+        marker: String,
     ) = withContext(Dispatchers.IO) {
         val baseUrl = manifestUrl.substringBeforeLast('/', "")
         if (baseUrl.isEmpty()) throw Exception("Bad manifest URL: $manifestUrl")
@@ -422,7 +439,13 @@ class ModelDownloadService : Service() {
             done += if (entry.size > 0) entry.size else target.length()
         }
 
-        if (isNpu) File(stageDir, "v3").createNewFile()
+        // Both stamps: "v3" keeps the shared NPU check satisfied, and the
+        // per-model marker is what lets this model alone be invalidated the
+        // next time its weights are rebuilt.
+        if (isNpu) {
+            File(stageDir, "v3").createNewFile()
+            if (marker != "v3") File(stageDir, marker).createNewFile()
+        }
 
         // Everything is present: swap staging into place as one step. Any
         // earlier install is removed first so a re-download cannot leave files
