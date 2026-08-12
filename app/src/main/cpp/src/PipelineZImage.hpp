@@ -138,7 +138,7 @@ class PipelineZImage : public PipelineQnn {
     // vae_decoder_ is a PipelineQnn member, so it is destroyed after all of
     // this class's members and after vae_encoder_ (declared later in the base,
     // destroyed first) — which makes it the only safe head here.
-    const uint64_t sf_bytes = spillFillGroupBytes();
+    const uint64_t sf_bytes = spillFillAllBytes();
     Qnn_ContextHandle_t head = nullptr;
     if (sf_bytes)
       QNN_INFO("[spill-fill] Z-Image context group sharing enabled: %llu bytes",
@@ -259,9 +259,12 @@ class PipelineZImage : public PipelineQnn {
     if (!lowram_) return;
     // The encode stage is over once the DiT is needed; never hold both.
     releaseVaeEncoder();
-    // seq_dit loads and releases each part inside every step, so there is
-    // nothing to pre-load.
-    if (!seq_dit_) loadDitPartsIfNeeded();
+    // seq_dit loads and releases each part inside every step, but NOT the
+    // caption branch: it heads the spill-fill group, so it has to outlive
+    // every part that references its buffer. 374 MB held for the loop is the
+    // price of not reallocating a gigabyte 33 times a step.
+    if (seq_dit_) loadCapPartAlone();
+    else loadDitPartsIfNeeded();
   }
 
   void runUnetStep(const GenerationRequest &, const float *latents_batch2,
@@ -404,13 +407,11 @@ class PipelineZImage : public PipelineQnn {
     if (hit) return;
 
     reportSub("Caption branch");
-    if (seq_dit_) loadCapPartAlone();
     if (!cap_part_)
       throw std::runtime_error("Z-Image DiT caption branch not loaded");
     const StatusCode st = cap_part_->executeZImageDitCaption(
         context, pos_ids_.data(), attn_mask_.data(), cap_pad_mask_.data(),
         (size_t)totalTokens(), cap_);
-    if (seq_dit_) cap_part_.reset();
     if (st != StatusCode::SUCCESS) {
       // Leave no half-valid cache behind: cap_ may hold the previous prompt's
       // result, and the key must never outlive the value it describes.
@@ -603,9 +604,11 @@ class PipelineZImage : public PipelineQnn {
   }
 
   // The parts run strictly in sequence (1 -> N) every step and stay resident
-  // for the whole denoising loop, so they share one spill-fill buffer: part 1
-  // is the group head, the rest reference it. It is created first and released
-  // last.
+  // for the whole denoising loop, so they share one spill-fill buffer. The
+  // CAPTION BRANCH is the group head: it is the smallest context of the set
+  // (374 MB against 385-491 MB) and the only one that has to exist in both
+  // this mode and seq_dit, which lets one rule cover both -- created first,
+  // released last, everything else references it.
   void loadDitPartsIfNeeded() {
     if (dit_parts_[0]) return;
     const uint64_t sf_bytes = spillFillGroupBytes();
@@ -613,16 +616,19 @@ class PipelineZImage : public PipelineQnn {
       QNN_INFO("[lowram] Z-Image DiT part group sharing enabled: %llu bytes",
                (unsigned long long)sf_bytes);
 
-    Qnn_ContextHandle_t head = nullptr;
     // The single longest silent stretch in a generation: 12.9 GB of context
     // binaries, all mapped before the first denoising step can start.
     const int n_load = (int)dit_parts_.size() + 1;      // + the caption branch
+    reportSub("Loading DiT", 0, n_load);
+    loadCapPartAlone();
+    const Qnn_ContextHandle_t head =
+        sf_bytes ? cap_part_->getContextHandle() : nullptr;
     for (size_t i = 0; i < dit_parts_.size(); ++i) {
       // At ERROR for the same reason the seq paths are: reportSub reaches the
       // progress bar but never the log, and the log is what survives a kill.
       QNN_ERROR("[dit] context %zu/%zu (co-resident)", i + 1,
                 dit_parts_.size());
-      reportSub("Loading DiT", (int)i, n_load);
+      reportSub("Loading DiT", (int)i + 1, n_load);
       dit_parts_[i] =
           qnn_runtime::createModel(dit_part_paths_[i], partTag(i).c_str());
       if (!dit_parts_[i])
@@ -633,32 +639,20 @@ class PipelineZImage : public PipelineQnn {
           EXIT_SUCCESS)
         throw std::runtime_error("[lowram] Failed to init Z-Image DiT part " +
                                  std::to_string(i + 1));
-      if (i == 0 && sf_bytes) head = dit_parts_[0]->getContextHandle();
     }
-    // The caption branch joins the same group. It executes before part 1 and
-    // never alongside it, so it shares the scratch buffer like everything else;
-    // it is created after the head and released before it.
-    reportSub("Loading DiT", n_load - 1, n_load);
-    cap_part_ = qnn_runtime::createModel(cap_part_path_, "unet_cap");
-    if (!cap_part_)
-      throw std::runtime_error(
-          "[lowram] Failed to create the Z-Image DiT caption branch");
-    cap_part_->setSpillFillGroup(sf_bytes, head);
-    if (qnn_runtime::initializeApp("unet_cap", cap_part_) != EXIT_SUCCESS)
-      throw std::runtime_error(
-          "[lowram] Failed to init the Z-Image DiT caption branch");
     QNN_INFO("[lowram] Z-Image DiT parts loaded (%zu + caption)",
              dit_parts_.size());
   }
   void releaseDitParts() {
     bool any = cap_part_ != nullptr;
-    cap_part_.reset();
-    // Reverse order: every group reference dies before its head (part 1).
+    // Reverse order, and the head last: every reference to the shared
+    // spill-fill buffer must die before the context that owns it.
     for (size_t i = dit_parts_.size(); i-- > 0;) {
       if (!dit_parts_[i]) continue;
       dit_parts_[i].reset();
       any = true;
     }
+    cap_part_.reset();
     // The refined caption outlives no DiT context: dropping it here is what
     // makes the next generation recompute it against whatever graphs are
     // loaded then, rather than trust a buffer from a released one.
@@ -683,11 +677,41 @@ class PipelineZImage : public PipelineQnn {
     QNN_ERROR("[dit-seq] part %zu/%zu: creating context", i + 1,
               dit_part_paths_.size());
     dit_parts_[i] =
-        qnn_runtime::createAndInitModel(dit_part_paths_[i], partTag(i).c_str());
+        qnn_runtime::createModel(dit_part_paths_[i], partTag(i).c_str());
     if (!dit_parts_[i])
+      throw std::runtime_error("[seq_dit] Failed to create Z-Image DiT part " +
+                               std::to_string(i + 1));
+    // Join the caption branch's group rather than allocating a private
+    // spill-fill buffer. That buffer is 1.03 GB for a refiner part and 842 MB
+    // for a block part -- twice the context binary itself -- so allocating one
+    // per part means asking the DSP for ~2.2 GB, freeing it, and asking again,
+    // 33 times per step. The device grants the first and refuses the second:
+    //     Failed to find available PD for contextId 1 ...
+    //         with context size estimate 2204186880
+    //     Skel failed to process context binary
+    // followed by an SSR that takes the whole DSP down. Referencing the head's
+    // buffer keeps one allocation alive for the whole denoising loop.
+    dit_parts_[i]->setSpillFillGroup(spillFillGroupBytes(), capGroupHead());
+    if (qnn_runtime::initializeApp(partTag(i).c_str(), dit_parts_[i]) !=
+        EXIT_SUCCESS) {
+      dit_parts_[i].reset();
       throw std::runtime_error("[seq_dit] Failed to load Z-Image DiT part " +
                                std::to_string(i + 1));
+    }
     QNN_ERROR("[dit-seq] part %zu ready", i + 1);
+  }
+
+  // The group head's context handle. The caption branch is loaded before any
+  // part in both modes, so this is never null by the time a part joins; it is
+  // checked rather than assumed because a null head silently means "start a new
+  // group", i.e. a private buffer and the failure above.
+  Qnn_ContextHandle_t capGroupHead() {
+    if (!spillFillGroupBytes()) return nullptr;
+    if (!cap_part_)
+      throw std::runtime_error(
+          "zimage: the DiT caption branch must be loaded before any part -- it "
+          "owns the shared spill-fill buffer");
+    return cap_part_->getContextHandle();
   }
   void releaseDitPart(size_t i) {
     if (!dit_parts_[i]) return;
@@ -719,13 +743,24 @@ class PipelineZImage : public PipelineQnn {
                                std::to_string(i + 1));
     QNN_ERROR("[clip-seq] part %zu ready", i + 1);
   }
+  // The caption branch, created as the spill-fill group HEAD. It owns the one
+  // scratch buffer every DiT part then references, so it must be created first
+  // and released last -- see spillFillGroupBytes for the measured sizes.
   void loadCapPartAlone() {
     if (cap_part_) return;
-    QNN_ERROR("[dit-seq] caption branch: creating context");
-    cap_part_ = qnn_runtime::createAndInitModel(cap_part_path_, "unet_cap");
+    const uint64_t sf_bytes = spillFillGroupBytes();
+    QNN_ERROR("[dit-seq] caption branch (spill-fill group head, %llu bytes): "
+              "creating context", (unsigned long long)sf_bytes);
+    cap_part_ = qnn_runtime::createModel(cap_part_path_, "unet_cap");
     if (!cap_part_)
       throw std::runtime_error(
+          "[seq_dit] Failed to create the Z-Image DiT caption branch");
+    cap_part_->setSpillFillGroup(sf_bytes, nullptr);
+    if (qnn_runtime::initializeApp("unet_cap", cap_part_) != EXIT_SUCCESS) {
+      cap_part_.reset();
+      throw std::runtime_error(
           "[seq_dit] Failed to load the Z-Image DiT caption branch");
+    }
     QNN_ERROR("[dit-seq] caption branch ready");
   }
 
@@ -743,16 +778,44 @@ class PipelineZImage : public PipelineQnn {
     if (lowram_) QNN_INFO("[lowram] Z-Image VAE encoder released");
   }
 
-  // Shared spill-fill buffer size (bytes) for the Z-Image context group. A DiT
-  // part's requirement depends on where the conversion cut the model, so the
-  // default is a starting point: override with
-  // LOCALDREAM_ZIMAGE_SPILL_FILL_BYTES (context creation failures log the real
-  // requirement as "...smaller than required spill-fill size N"; take the max
-  // across parts). 0 disables sharing.
-  static uint64_t spillFillGroupBytes() {
+  // Shared spill-fill buffer size (bytes) for a Z-Image context group.
+  //
+  // These are MEASURED, not guessed. Every context binary carries its graph's
+  // requirement in its metadata, and `qnn-context-binary-utility --json_file`
+  // prints it as graphBlobInfo.info.spillFillBufferSize. On the published
+  // 32-part build:
+  //
+  //   graph                       blob      spill-fill
+  //   unet_part1 / unet_part2   491 MB      1033.6 MB   (the noise refiner)
+  //   unet_part3 .. unet_part32 385 MB       842.0 MB   (one block each)
+  //   unet_cap                  374 MB        47.3 MB
+  //   clip_part1 .. 6           620 MB        29.5 MB
+  //   vae_decoder               198 MB      1776.2 MB
+  //
+  // The previous single constant was 601 MB, which is under what EVERY DiT
+  // part needs and a third of what the VAE decoder needs. Only the group
+  // head's value is honored by the backend, so one number too small does not
+  // degrade anything -- it fails context creation outright, with the real
+  // figure in the log as "smaller than required spill-fill size N".
+  //
+  // Hence two values, each the maximum over the graphs actually in that group.
+  // Override either with LOCALDREAM_ZIMAGE_SPILL_FILL_BYTES; 0 disables
+  // sharing. Re-measure after any conversion that changes how the model is
+  // cut, since the requirement is a property of the compiled graph.
+  static uint64_t spillFillOverride() {
     const char *e = getenv("LOCALDREAM_ZIMAGE_SPILL_FILL_BYTES");
-    if (e && *e) return strtoull(e, nullptr, 10);
-    return 601096192ULL;
+    return (e && *e) ? strtoull(e, nullptr, 10) : 0;
+  }
+  // DiT parts + the caption branch.
+  static uint64_t spillFillGroupBytes() {
+    const uint64_t o = spillFillOverride();
+    return o ? o : 1033633792ULL;
+  }
+  // ...and the same group with the VAE in it, which is the resident (non-lowram)
+  // case where every context lives at once.
+  static uint64_t spillFillAllBytes() {
+    const uint64_t o = spillFillOverride();
+    return o ? o : 1776238592ULL;
   }
 
   const std::vector<std::string> clip_part_paths_;
