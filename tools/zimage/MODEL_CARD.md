@@ -27,8 +27,8 @@ library_name: local-dream
 > | ONNX matches PyTorch | ✅ ~1e-6 |
 > | Graphs accepted by `qairt-converter` | ✅ |
 > | Quantization error after w4a16 | ❌ never measured |
-> | Runs on an NPU at all | ❌ never attempted |
-> | Whether 8 Gen 2 (v73) has the headroom for a 6B DiT | ❌ unknown |
+> | Text encoder, caption branch and DiT part 1 load and run on an 8 Gen 2 | ✅ reported |
+> | The whole 33-graph DiT chain loading | ❌ failed once, fixed, not yet retested |
 > | Output image quality | ❌ unknown |
 >
 > If it does not work, that is expected rather than surprising. Please open an
@@ -52,6 +52,35 @@ below — an older build will not load this model.
 It is a **debug** build: installable and signed with the standard Android debug
 key, so it coexists with a Play/release install rather than upgrading it.
 arm64-v8a only. Sideload with `adb install <apk>` or a file manager.
+
+**2026-08-13 — this APK replaces one that could not get past DiT part 2.** The
+weights are unchanged; do not re-download them. The first device run got the
+text encoder, the caption branch and part 1 loaded, then failed:
+
+```
+[dit-seq] part 2/32: creating context
+Failed to find available PD for contextId 1 ... with context size estimate 2204186880
+Skel failed to process context binary
+```
+
+Every context binary records the HTP scratch ("spill-fill") its graph needs,
+and `qnn-context-binary-utility --json_file` prints it:
+
+| graph | blob | spill-fill |
+|---|---|---|
+| `unet_part1` / `unet_part2` (noise refiner) | 491 MB | 1033.6 MB |
+| `unet_part3` … `unet_part32` (one block each) | 385 MB | 842.0 MB |
+| `unet_cap` | 374 MB | 47.3 MB |
+| `clip_part1` … `clip_part6` | 620 MB | 29.5 MB |
+| `vae_decoder` | 198 MB | 1776.2 MB |
+
+The scratch buffer is twice the context binary. Sequential loading was
+allocating a private one per part, so each part asked the DSP for ~2.2 GB,
+freed it and asked again, 33 times per step; the device granted the first and
+refused the second, then went into an SSR. The caption branch now heads a
+spill-fill group that every part references, so one allocation serves the whole
+denoising loop. The group size was also a stale constant — 601 MB, below what
+every DiT part needs and a third of the VAE decoder's — and is now measured.
 
 **If you installed the model before 2026-08-12 14:22 UTC, install this APK and
 let it refresh the model.** The manifest published before that time listed 38
