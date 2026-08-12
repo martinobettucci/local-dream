@@ -70,7 +70,13 @@ class ModelDownloadService : Service() {
         // protection domain is that large, so an install carrying them cannot
         // generate at all -- and, being complete, would never have refreshed
         // itself on the shared marker.
-        const val ZIMAGE_MARKER = "zimage_attn5"
+        // Bumped from "zimage_attn5": installs made against the 38-file
+        // manifest are missing the whole text encoder and token_emb.bin, and
+        // the backend calls showHelpAndExit over clip_part1.bin. They carry the
+        // old marker, so without a new one they look finished forever. The
+        // refresh they get is cheap -- staging links the 13 GB they already
+        // hold and fetches only the 4.4 GB that never arrived.
+        const val ZIMAGE_MARKER = "zimage_attn5_enc"
         const val EXTRA_IS_NPU = "is_npu"
         const val EXTRA_MODEL_TYPE = "model_type" // "sd" or "upscaler"
 
@@ -401,6 +407,45 @@ class ModelDownloadService : Service() {
                 Log.i(TAG, "manifest: dropping stale staged " + f.name)
                 f.delete()
             }
+        }
+
+        // Seed staging from the install being replaced. Resume already skips
+        // anything staged at the right size, but staging is empty whenever the
+        // LAST attempt succeeded -- so a re-download after a corrected manifest
+        // refetches every byte, including the ones already on the device. That
+        // is the situation this exists for: the published manifest lost the
+        // text encoder, so installs are complete-looking, unusable, and 13 of
+        // their 17 GB are perfectly good.
+        //
+        // Hard links, not moves or copies: a move would gut the working install
+        // if the download then failed, and a copy would need the model's size
+        // in free space twice over. A link costs an inode. modelDir and
+        // stageDir are siblings, so they are always on one filesystem.
+        //
+        // Same name and same size is the match, which is what resume already
+        // trusts a partly-staged file on -- the manifest carries no digest. A
+        // rebuilt graph that happens to land on its predecessor's exact byte
+        // count would survive this; that is what the per-model marker is for,
+        // and why a rebuild bumps it.
+        if (modelDir.isDirectory) {
+            var linked = 0L
+            for (entry in files) {
+                if (entry.size <= 0) continue
+                val have = File(modelDir, entry.name)
+                val stage = File(stageDir, entry.name)
+                if (have.length() != entry.size || stage.exists()) continue
+                try {
+                    android.system.Os.link(have.absolutePath, stage.absolutePath)
+                    linked += entry.size
+                } catch (e: Throwable) {
+                    // No links on this filesystem, or a race: fall through and
+                    // let it download normally.
+                    Log.i(TAG, "manifest: cannot reuse ${entry.name}: ${e.message}")
+                }
+            }
+            if (linked > 0)
+                Log.i(TAG, "manifest: reusing ${linked / 1_000_000} MB from the " +
+                        "previous install")
         }
 
         val grandTotal = files.sumOf { if (it.size > 0) it.size else 0L }
