@@ -53,6 +53,14 @@ It is a **debug** build: installable and signed with the standard Android debug
 key, so it coexists with a Play/release install rather than upgrading it.
 arm64-v8a only. Sideload with `adb install <apk>` or a file manager.
 
+**If you installed the model before 2026-08-12 14:22 UTC, install this APK and
+let it refresh the model.** The manifest published before that time listed 38
+files instead of 45 — it had lost the text encoder — so those installs look
+complete and cannot start: the backend exits on the missing `clip_part1.bin`.
+This build knows those installs are stale and offers the refresh, and it seeds
+the download from what you already have, so it fetches the missing 4.4 GB
+rather than all 17.7 GB again.
+
 The Z-Image runner inside it has never executed a single graph. Installing it
 and reaching the model list proves the app works; it proves nothing about
 Z-Image.
@@ -85,7 +93,7 @@ ephemeral machines with less free disk than the finished model needs —
 publishing every piece immediately is what stops a reclaimed container from
 costing the whole run.
 
-`partial/n32/stats/*.tsv` records peak RSS and wall clock per stage
+`partial/n32-attn5/stats/*.tsv` records peak RSS and wall clock per stage
 (`stage`, `peak_rss_kb`, `seconds`, `exit_code`) for the machine that built each
 graph. That is what the split is chosen from, and it is worth reading, because
 the split is not arbitrary — see below.
